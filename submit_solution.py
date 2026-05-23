@@ -1235,65 +1235,6 @@ def solve(input_text: str) -> list:
             answer.append((task_key, couriers))
         return answer
 
-    def large_seed301_hint():
-        if len(rows) != 33780 or len(all_tasks) != 40 or len(all_couriers) != 80:
-            return {}
-        score_sum = round(sum(score for _, _, _, score, _ in rows), 3)
-        willing_sum = round(sum(willingness for _, _, _, _, willingness in rows), 4)
-        if score_sum != 1904995.942 or willing_sum != 10133.0892:
-            return {}
-
-        groups = {
-            "T0000": ["C067", "C016"],
-            "T0001": ["C059", "C015"],
-            "T0002": ["C017", "C060"],
-            "T0003": ["C068", "C035"],
-            "T0004": ["C045", "C026"],
-            "T0005": ["C025", "C052"],
-            "T0006": ["C064", "C008", "C055"],
-            "T0007": ["C061", "C034"],
-            "T0008": ["C001", "C033"],
-            "T0009": ["C066", "C010"],
-            "T0010": ["C037", "C005"],
-            "T0011": ["C018", "C056", "C038"],
-            "T0012": ["C022", "C002"],
-            "T0013": ["C076", "C062"],
-            "T0014": ["C073", "C047"],
-            "T0015": ["C051", "C006"],
-            "T0016": ["C023", "C000"],
-            "T0017": ["C053", "C043"],
-            "T0018": ["C004", "C063"],
-            "T0019": ["C012", "C007"],
-            "T0020": ["C009", "C050"],
-            "T0021": ["C049", "C027"],
-            "T0022": ["C011", "C041"],
-            "T0023": ["C036", "C079"],
-            "T0024": ["C024"],
-            "T0025": ["C065", "C013"],
-            "T0026": ["C020"],
-            "T0027": ["C030", "C019"],
-            "T0028": ["C044", "C046"],
-            "T0029": ["C071", "C003"],
-            "T0030": ["C072", "C077"],
-            "T0031": ["C029", "C031", "C058"],
-            "T0032": ["C078"],
-            "T0033": ["C039"],
-            "T0034": ["C054", "C042", "C070"],
-            "T0035": ["C028", "C069"],
-            "T0036": ["C057", "C021"],
-            "T0037": ["C074", "C075"],
-            "T0038": ["C040", "C032"],
-            "T0039": ["C014", "C048"],
-        }
-        return groups if valid_groups(groups) and covered_count(groups) == len(all_tasks) else {}
-
-    hinted = large_seed301_hint()
-    if hinted:
-        value = total_penalty(hinted)
-        solve.best_history = [(0, len(all_tasks), round(value, 6))]
-        solve.best_value = value
-        return format_answer(hinted)
-
     starts = []
     # The heavier structural search is intentionally disabled for submission.
     # It helped on local synthetic scarce-courier slices, but on the hidden
