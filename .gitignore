@@ -1,0 +1,41 @@
+# Python bytecode/cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments and local Python tooling
+.venv/
+venv/
+env/
+.env
+.env.*
+.python-version
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local editor/IDE state
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Local Codex/agent runtime files
+.agents/
+.codex/
+
+# Logs and generated outputs
+*.log
+logs/
+output/
+outputs/
+results/
+tmp/
+temp/
+
+# OS metadata
+.DS_Store
+Thumbs.db
