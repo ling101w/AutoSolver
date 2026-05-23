@@ -1464,4 +1464,3 @@ def solve(input_text: str) -> list:
         couriers.sort(key=lambda c: (-by_key[task_key][c][1], by_key[task_key][c][0]))
         answer.append((task_key, couriers))
     return answer
-。， ·
