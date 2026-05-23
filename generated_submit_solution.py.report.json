@@ -1,0 +1,66 @@
+{
+  "best": {
+    "cases": [
+      {
+        "case": "synthetic_0",
+        "covered": 8,
+        "error": null,
+        "penalty": 322.4833627184402,
+        "runtime": 0.9201211929321289,
+        "status": "ok",
+        "tasks": 8
+      },
+      {
+        "case": "synthetic_1",
+        "covered": 12,
+        "error": null,
+        "penalty": 470.014595042501,
+        "runtime": 0.9204013347625732,
+        "status": "ok",
+        "tasks": 12
+      },
+      {
+        "case": "synthetic_2",
+        "covered": 16,
+        "error": null,
+        "penalty": 682.9760913740358,
+        "runtime": 0.920224666595459,
+        "status": "ok",
+        "tasks": 16
+      }
+    ],
+    "failures": 0,
+    "name": "expected_greedy",
+    "rank": [
+      0,
+      -36,
+      1475.4740491349771,
+      2.760747194290161
+    ],
+    "total_covered": 36,
+    "total_penalty": 1475.4740491349771,
+    "total_runtime": 2.760747194290161,
+    "total_tasks": 36
+  },
+  "cases": [
+    "synthetic_0",
+    "synthetic_1",
+    "synthetic_2"
+  ],
+  "evaluated_candidates": 1,
+  "output_path": "/home/aigix49/Project/generated_submit_solution.py",
+  "reference": {
+    "failures": 3,
+    "name": "reference",
+    "rank": [
+      3,
+      0,
+      3003600.0,
+      3.6068434715270996
+    ],
+    "total_covered": 0,
+    "total_penalty": 3003600.0,
+    "total_runtime": 3.6068434715270996,
+    "total_tasks": 36
+  }
+}
