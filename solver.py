@@ -1,77 +1,14 @@
-import math
-import random
-import time
-
-
-RNG_SEED = 301_2026
-MOVE_ARMS = ("add", "remove", "replace_courier", "activate", "replace_group")
-
-LOCAL_STALL_LIMIT = 2000
-DEEPOPT_STALL_LIMIT = 8000
-RESTART_STALL_LIMIT = 20000
-
-BIG = 1_000_000.0
+BIG = 10_000.0
 TASK_FALLBACK_PER_TASK = 100.0
-TIME_LIMIT_SECONDS = 8.75
 EPS = 1e-12
 
-BANDIT_EXPLORATION = 0.65
-BANDIT_RANDOM_RATE = 0.08
-BANDIT_REWARD_CAP = 10_000.0
-BEST_REWARD_BONUS = 5_000.0
-BANDIT_MIN_LOG_TOTAL = 2
-BANDIT_SOFT_RESET_COUNT_DIVISOR = 2
-BANDIT_SOFT_RESET_VALUE_SCALE = 0.5
-
-INITIAL_GREEDY_MOVE_LIMIT = 260
-DEEPOPT_GREEDY_MOVE_LIMIT = 90
-RESTART_GREEDY_MOVE_LIMIT = 260
-DEEPOPT_TIME_MARGIN = 0.08
-
-INITIAL_TOP_CANDIDATES = 10
-INITIAL_GREEDY_CHOICE_PROB = 0.82
-INITIAL_RANDOM_CHOICE_LIMIT = 4
-INITIAL_NOISE_BASE = 2.0
-INITIAL_NOISE_RESTART_SCALE = 0.35
-INITIAL_NOISE_RESTART_PERIOD = 7
-INITIAL_TASK_COUNT_BONUS = 0.02
-
-WARMUP_GROUP_SAMPLE_LIMIT = 48
-WARMUP_ADD_CANDIDATE_LIMIT = 16
-WARMUP_REPLACE_CANDIDATE_LIMIT = 14
-WARMUP_ACTIVATE_SAMPLE = 80
-
-ADD_MOVE_TRIALS = 72
-ADD_MOVE_CANDIDATE_POOL = 24
-REMOVE_MOVE_TRIALS = 56
-REPLACE_COURIER_MOVE_TRIALS = 72
-REPLACE_COURIER_INNER_TRIALS = 3
-REPLACE_COURIER_CANDIDATE_POOL = 28
-ACTIVATE_MOVE_TRIALS = 88
-REPLACE_GROUP_MOVE_TRIALS = 80
-GROUP_CONFCHANGE_SKIP_PROB = 0.65
-ACTIVATE_CONFCHANGE_SKIP_PROB = 0.55
-
-TABU_TENURE_BASE = 7
-TABU_TENURE_SPAN = 11
-
-RUIN_TASK_SAMPLE_MIN = 4
-RUIN_TASK_SAMPLE_MAX_EXCLUSIVE = 9
-RUIN_TASK_SAMPLE_FLOOR = 5
-RUIN_REMOVE_GROUP_LIMIT = 10
-RUIN_CANDIDATE_NOISE = 3.0
-RUIN_CANDIDATE_LIMIT = 80
-RUIN_GREEDY_MOVE_LIMIT = 90
-RUIN_RESTORE_ENERGY_SLACK = 250_000.0
-RUIN_RESTORE_PROB = 0.55
-
-DEEPOPT_GROUP_SAMPLE_MIN = 2
-DEEPOPT_GROUP_SAMPLE_MAX_EXCLUSIVE = 6
-DEEPOPT_EXTRA_TASKS = 6
-DEEPOPT_CANDIDATE_LIMIT = 90
-DEEPOPT_BEAM_WIDTH = 80
-DEEPOPT_STEP_TIME_MARGIN = 0.015
-DEEPOPT_FINAL_GREEDY_MOVE_LIMIT = 120
+LOCAL_POLISH_PASSES = 8
+PAIR_REPLACEMENT_ROUNDS = 5
+PAIR_REPLACEMENT_CANDIDATE_LIMIT = 120
+PAIR_REPLACEMENT_SHORTLIST = 20
+HASH_START_SEEDS = (289, 245, 173, 95, 242)
+THREE_CYCLE_MOVE_LIMIT = 5
+THREE_CYCLE_MAX_ACTIVE_GROUPS = 45
 
 
 def popcount(mask: int) -> int:
@@ -82,7 +19,11 @@ class Candidate:
     __slots__ = ("courier", "score", "willingness", "singleton_penalty")
 
     def __init__(
-        self, courier: int, score: float, willingness: float, singleton_penalty: float
+        self,
+        courier: int,
+        score: float,
+        willingness: float,
+        singleton_penalty: float,
     ) -> None:
         self.courier = courier
         self.score = score
@@ -100,7 +41,6 @@ class ProblemData:
         self.cand_by_group = []
         self.groups_by_courier = []
         self.courier_names = []
-        self.conflict_groups = []
         self.total_tasks = 0
         self.task_full_mask = 0
 
@@ -124,98 +64,9 @@ class State:
         self.covered_count = 0
         self.total_penalty = 0.0
 
-    def copy(self) -> "State":
-        other = State(self.data)
-        other.active = set(self.active)
-        other.assigned = [s.copy() for s in self.assigned]
-        other.owner = self.owner[:]
-        other.sum_w = self.sum_w[:]
-        other.sum_ws = self.sum_ws[:]
-        other.reject_prod = self.reject_prod[:]
-        other.zero_rejects = self.zero_rejects[:]
-        other.group_penalty = self.group_penalty[:]
-        other.task_mask = self.task_mask
-        other.covered_count = self.covered_count
-        other.total_penalty = self.total_penalty
-        return other
-
     @property
     def energy(self) -> float:
         return self.total_penalty + BIG * (self.data.total_tasks - self.covered_count)
-
-
-class TabuTable:
-    def __init__(self) -> None:
-        self.courier_group = {}
-        self.group_add = {}
-        self.group_remove = {}
-
-    def clear(self) -> None:
-        self.courier_group.clear()
-        self.group_add.clear()
-        self.group_remove.clear()
-
-
-class ConfChange:
-    def __init__(self, data: ProblemData) -> None:
-        self.data = data
-        self.group = [True] * len(data.group_names)
-        self.courier = [True] * len(data.courier_names)
-
-    def reset(self) -> None:
-        self.group = [True] * len(self.data.group_names)
-        self.courier = [True] * len(self.data.courier_names)
-
-    def touch(self, groups, couriers) -> None:
-        for g in groups:
-            self.group[g] = False
-            for ng in self.data.conflict_groups[g]:
-                self.group[ng] = True
-        for c in couriers:
-            self.courier[c] = False
-            for g in self.data.groups_by_courier[c]:
-                self.group[g] = True
-
-
-class MoveBandit:
-    def __init__(self, arms) -> None:
-        self.arms = arms
-        self.counts = [0] * len(arms)
-        self.values = [0.0] * len(arms)
-        self.total = 0
-
-    def select(self, rng: random.Random) -> str:
-        for i, cnt in enumerate(self.counts):
-            if cnt == 0:
-                return self.arms[i]
-
-        self.total += 1
-        log_total = math.log(max(BANDIT_MIN_LOG_TOTAL, self.total))
-        best_i = 0
-        best_score = -1.0
-        for i, value in enumerate(self.values):
-            score = value + BANDIT_EXPLORATION * math.sqrt(
-                log_total / self.counts[i]
-            )
-            if score > best_score:
-                best_score = score
-                best_i = i
-        if rng.random() < BANDIT_RANDOM_RATE:
-            return rng.choice(self.arms)
-        return self.arms[best_i]
-
-    def update(self, arm: str, reward: float) -> None:
-        i = self.arms.index(arm)
-        self.counts[i] += 1
-        reward = min(BANDIT_REWARD_CAP, max(0.0, reward))
-        self.values[i] += (reward - self.values[i]) / self.counts[i]
-
-    def soft_reset(self) -> None:
-        self.counts = [
-            max(0, c // BANDIT_SOFT_RESET_COUNT_DIVISOR) for c in self.counts
-        ]
-        self.values = [v * BANDIT_SOFT_RESET_VALUE_SCALE for v in self.values]
-        self.total = sum(self.counts)
 
 
 def solve(input_text: str) -> list:
@@ -223,94 +74,8 @@ def solve(input_text: str) -> list:
     if not data.group_names:
         return []
 
-    deadline = time.perf_counter() + TIME_LIMIT_SECONDS
-    rng = random.Random(RNG_SEED)
-
-    restart_id = 0
-    current = construct_initial_solution(data, rng, restart_id)
-    greedy_warmup(
-        current, rng, move_limit=INITIAL_GREEDY_MOVE_LIMIT, deadline=deadline
-    )
-    best = current.copy()
-
-    tabu = TabuTable()
-    confchange = ConfChange(data)
-    bandit = MoveBandit(MOVE_ARMS)
-
-    iter_id = 0
-    last_improve_iter = 0
-    last_best_iter = 0
-    last_deepopt_iter = 0
-
-    while time.perf_counter() < deadline:
-        iter_id += 1
-        arm = bandit.select(rng)
-        move = generate_move(current, best, arm, tabu, confchange, iter_id, rng)
-
-        if move is not None:
-            old_energy = current.energy
-            old_best_key = state_key(best)
-            apply_move(current, move)
-            update_tabu(tabu, move, iter_id, rng)
-            update_confchange(confchange, move)
-
-            reward = max(0.0, old_energy - current.energy)
-            if state_key(current) < old_best_key:
-                reward += BEST_REWARD_BONUS
-            bandit.update(arm, reward)
-
-            if current.energy + EPS < old_energy:
-                last_improve_iter = iter_id
-
-            if better(current, best):
-                best = current.copy()
-                last_best_iter = iter_id
-                last_deepopt_iter = iter_id
-        else:
-            bandit.update(arm, 0.0)
-
-        if iter_id - last_improve_iter >= LOCAL_STALL_LIMIT:
-            before = current.energy
-            ruin_recreate(current, rng, deadline)
-            last_improve_iter = iter_id
-            if current.energy + EPS < before:
-                last_improve_iter = iter_id
-            if better(current, best):
-                best = current.copy()
-                last_best_iter = iter_id
-                last_deepopt_iter = iter_id
-
-        if (
-            iter_id - last_best_iter >= DEEPOPT_STALL_LIMIT
-            and iter_id - last_deepopt_iter >= DEEPOPT_STALL_LIMIT
-            and time.perf_counter() + DEEPOPT_TIME_MARGIN < deadline
-        ):
-            deepopt(current, rng, deadline)
-            greedy_warmup(
-                current, rng, move_limit=DEEPOPT_GREEDY_MOVE_LIMIT, deadline=deadline
-            )
-            last_improve_iter = iter_id
-            last_deepopt_iter = iter_id
-            if better(current, best):
-                best = current.copy()
-                last_best_iter = iter_id
-
-        if iter_id - last_best_iter >= RESTART_STALL_LIMIT:
-            restart_id += 1
-            current = construct_initial_solution(data, rng, restart_id)
-            greedy_warmup(
-                current, rng, move_limit=RESTART_GREEDY_MOVE_LIMIT, deadline=deadline
-            )
-            tabu.clear()
-            confchange.reset()
-            bandit.soft_reset()
-            last_improve_iter = iter_id
-            last_best_iter = iter_id
-            last_deepopt_iter = iter_id
-            if better(current, best):
-                best = current.copy()
-
-    return format_solution(best)
+    state = construct_task_first_greedy_solution(data)
+    return format_solution(state)
 
 
 def parse_input(input_text: str) -> ProblemData:
@@ -359,7 +124,6 @@ def parse_input(input_text: str) -> ProblemData:
     data.courier_names = [""] * len(courier_to_id)
     for name, idx in courier_to_id.items():
         data.courier_names[idx] = name
-
     data.groups_by_courier = [[] for _ in data.courier_names]
 
     for group_name, rows in grouped.items():
@@ -374,18 +138,19 @@ def parse_input(input_text: str) -> ProblemData:
         best_by_courier = {}
         for courier, score, willingness in rows:
             old = best_by_courier.get(courier)
-            if old is None or singleton_penalty(fallback, score, willingness) < singleton_penalty(fallback, old[0], old[1]):
+            new_penalty = singleton_penalty(fallback, score, willingness)
+            if old is None or new_penalty < singleton_penalty(fallback, old[0], old[1]):
                 best_by_courier[courier] = (score, willingness)
 
         group_id = len(data.group_names)
         candidates = [
             Candidate(
-                courier=c,
+                courier=courier,
                 score=score,
-                willingness=w,
-                singleton_penalty=singleton_penalty(fallback, score, w),
+                willingness=willingness,
+                singleton_penalty=singleton_penalty(fallback, score, willingness),
             )
-            for c, (score, w) in best_by_courier.items()
+            for courier, (score, willingness) in best_by_courier.items()
         ]
         candidates.sort(key=lambda x: (x.singleton_penalty, x.score, -x.willingness))
 
@@ -398,31 +163,592 @@ def parse_input(input_text: str) -> ProblemData:
         for cand in candidates:
             data.groups_by_courier[cand.courier].append(group_id)
 
-    n_groups = len(data.group_names)
-    data.conflict_groups = [[] for _ in range(n_groups)]
-    for i in range(n_groups):
-        mi = data.group_masks[i]
-        for j in range(n_groups):
-            if i != j and (mi & data.group_masks[j]):
-                data.conflict_groups[i].append(j)
-
     return data
+
+
+def construct_task_first_greedy_solution(data: ProblemData) -> State:
+    groups = choose_cover_groups(data)
+    best = None
+
+    for state in initial_single_task_states(data, groups):
+        if better_state(state, best):
+            best = state
+
+    improve_by_pair_group_replacements(best)
+    polish_three_courier_cycles(best)
+    return best
+
+
+def initial_single_task_states(data: ProblemData, groups: list):
+    state = State(data)
+    seed_groups_by_regret(state, groups)
+    allocate_remaining_couriers_by_gain(state)
+    polish_courier_assignment(state)
+    yield state
+
+    orders = [
+        sorted(groups, key=lambda g: data.group_names[g], reverse=True),
+        sorted(groups, key=lambda g: data.group_candidates[g][0].singleton_penalty if data.group_candidates[g] else BIG),
+        sorted(groups, key=lambda g: -data.group_candidates[g][0].willingness if data.group_candidates[g] else 0.0),
+    ]
+    for order in orders:
+        state = construct_ordered_seed_state(data, order)
+        yield state
+
+    for seed in HASH_START_SEEDS:
+        order = sorted(groups, key=lambda g: hash_start_key(data, g, seed))
+        state = construct_ordered_seed_state(data, order)
+        yield state
+
+
+def construct_ordered_seed_state(data: ProblemData, ordered_groups: list) -> State:
+    state = State(data)
+    for group in ordered_groups:
+        courier = best_available_seed_courier(state, group)
+        if courier is not None:
+            add_courier(state, group, courier)
+    allocate_remaining_couriers_by_gain(state)
+    polish_courier_assignment(state)
+    return state
+
+
+def better_state(a: State, b) -> bool:
+    if b is None:
+        return True
+    if a.covered_count != b.covered_count:
+        return a.covered_count > b.covered_count
+    return a.total_penalty + EPS < b.total_penalty
+
+
+def hash_start_key(data: ProblemData, group: int, seed: int) -> int:
+    value = group_order_number(data, group) + seed * 0x9E3779B1
+    value &= 0xFFFFFFFF
+    value ^= value >> 16
+    value = (value * 0x7FEB352D) & 0xFFFFFFFF
+    value ^= value >> 15
+    value = (value * 0x846CA68B) & 0xFFFFFFFF
+    value ^= value >> 16
+    return value
+
+
+def group_order_number(data: ProblemData, group: int) -> int:
+    name = data.group_names[group].split(",")[0]
+    if len(name) > 1 and name[0] == "T" and name[1:].isdigit():
+        return int(name[1:])
+    return group
+
+
+def choose_cover_groups(data: ProblemData) -> list:
+    selected = []
+    covered_mask = 0
+
+    for group in range(len(data.group_names)):
+        if data.group_task_counts[group] == 1:
+            selected.append(group)
+            covered_mask |= data.group_masks[group]
+
+    if covered_mask == data.task_full_mask:
+        return selected
+
+    selected_set = set(selected)
+    while covered_mask != data.task_full_mask:
+        missing_mask = data.task_full_mask & ~covered_mask
+        best_group = -1
+        best_key = None
+
+        for group in range(len(data.group_names)):
+            if group in selected_set:
+                continue
+            group_mask = data.group_masks[group]
+            if group_mask & covered_mask:
+                continue
+            newly_covered = popcount(group_mask & missing_mask)
+            if newly_covered <= 0:
+                continue
+            seed_penalty = best_seed_penalty(data, group)
+            key = (
+                seed_penalty / newly_covered,
+                -newly_covered,
+                data.group_names[group],
+            )
+            if best_key is None or key < best_key:
+                best_key = key
+                best_group = group
+
+        if best_group == -1:
+            break
+
+        selected.append(best_group)
+        selected_set.add(best_group)
+        covered_mask |= data.group_masks[best_group]
+
+    return selected
+
+
+def seed_groups_by_regret(state: State, groups: list) -> None:
+    remaining = set(groups)
+
+    while remaining:
+        best_group = -1
+        best_key = None
+
+        for group in remaining:
+            penalties = available_seed_penalties(state, group)
+            if not penalties:
+                continue
+            regret = penalties[1] - penalties[0] if len(penalties) > 1 else BIG
+            key = (-regret, -penalties[0], state.data.group_names[group])
+            if best_key is None or key < best_key:
+                best_key = key
+                best_group = group
+
+        if best_group == -1:
+            break
+
+        courier = best_available_seed_courier(state, best_group)
+        if courier is not None:
+            add_courier(state, best_group, courier)
+        remaining.remove(best_group)
+
+
+def available_seed_penalties(state: State, group: int) -> list:
+    penalties = [
+        cand.singleton_penalty
+        for cand in state.data.group_candidates[group]
+        if state.owner[cand.courier] == -1
+    ]
+    penalties.sort()
+    return penalties
+
+
+def best_available_seed_courier(state: State, group: int):
+    for cand in state.data.group_candidates[group]:
+        if state.owner[cand.courier] == -1:
+            return cand.courier
+    return None
+
+
+def best_seed_penalty(data: ProblemData, group: int) -> float:
+    if not data.group_candidates[group]:
+        return BIG
+    return data.group_candidates[group][0].singleton_penalty
+
+
+def allocate_remaining_couriers_by_gain(state: State) -> int:
+    moves = 0
+    while True:
+        best_group = -1
+        best_courier = -1
+        best_delta = -EPS
+
+        for group in sorted(state.active, key=lambda g: state.data.group_names[g]):
+            for cand in state.data.group_candidates[group]:
+                courier = cand.courier
+                if state.owner[courier] != -1:
+                    continue
+                delta = penalty_after_add(state, group, courier) - state.group_penalty[group]
+                if delta < best_delta:
+                    best_delta = delta
+                    best_group = group
+                    best_courier = courier
+
+        if best_group == -1:
+            return moves
+
+        add_courier(state, best_group, best_courier)
+        moves += 1
+
+
+def polish_courier_assignment(state: State) -> None:
+    for _ in range(LOCAL_POLISH_PASSES):
+        moves = 0
+        moves += relocate_couriers_by_gain(state)
+        moves += swap_couriers_by_gain(state)
+        moves += allocate_remaining_couriers_by_gain(state)
+        if moves == 0:
+            break
+
+
+def relocate_couriers_by_gain(state: State) -> int:
+    moves = 0
+    while True:
+        best_from = -1
+        best_to = -1
+        best_courier = -1
+        best_delta = -EPS
+
+        active = sorted(state.active, key=lambda g: state.data.group_names[g])
+        for from_group in active:
+            if len(state.assigned[from_group]) <= 1:
+                continue
+
+            for courier in sorted(state.assigned[from_group]):
+                remove_delta = (
+                    penalty_after_remove(state, from_group, courier)
+                    - state.group_penalty[from_group]
+                )
+
+                for to_group in active:
+                    if to_group == from_group:
+                        continue
+                    if courier in state.assigned[to_group]:
+                        continue
+                    if courier not in state.data.cand_by_group[to_group]:
+                        continue
+
+                    add_delta = (
+                        penalty_after_add(state, to_group, courier)
+                        - state.group_penalty[to_group]
+                    )
+                    delta = remove_delta + add_delta
+                    if delta < best_delta:
+                        best_delta = delta
+                        best_from = from_group
+                        best_to = to_group
+                        best_courier = courier
+
+        if best_courier == -1:
+            return moves
+
+        remove_courier(state, best_from, best_courier)
+        add_courier(state, best_to, best_courier)
+        moves += 1
+
+
+def swap_couriers_by_gain(state: State) -> int:
+    moves = 0
+    while True:
+        best_a = -1
+        best_b = -1
+        best_ca = -1
+        best_cb = -1
+        best_delta = -EPS
+
+        active = sorted(state.active, key=lambda g: state.data.group_names[g])
+        for i, group_a in enumerate(active):
+            for group_b in active[i + 1 :]:
+                old_penalty = state.group_penalty[group_a] + state.group_penalty[group_b]
+
+                for courier_a in sorted(state.assigned[group_a]):
+                    if courier_a not in state.data.cand_by_group[group_b]:
+                        continue
+                    for courier_b in sorted(state.assigned[group_b]):
+                        if courier_b not in state.data.cand_by_group[group_a]:
+                            continue
+
+                        new_a = (state.assigned[group_a] - {courier_a}) | {courier_b}
+                        new_b = (state.assigned[group_b] - {courier_b}) | {courier_a}
+                        new_penalty = penalty_for_courier_set(
+                            state.data,
+                            group_a,
+                            new_a,
+                        ) + penalty_for_courier_set(state.data, group_b, new_b)
+                        delta = new_penalty - old_penalty
+                        if delta < best_delta:
+                            best_delta = delta
+                            best_a = group_a
+                            best_b = group_b
+                            best_ca = courier_a
+                            best_cb = courier_b
+
+        if best_ca == -1:
+            return moves
+
+        remove_courier(state, best_a, best_ca)
+        remove_courier(state, best_b, best_cb)
+        add_courier(state, best_a, best_cb)
+        add_courier(state, best_b, best_ca)
+        moves += 1
+
+
+def improve_by_pair_group_replacements(state: State) -> None:
+    data = state.data
+    single_group_by_mask = {
+        data.group_masks[group]: group
+        for group in range(len(data.group_names))
+        if data.group_task_counts[group] == 1
+    }
+    pair_groups = [
+        group
+        for group in range(len(data.group_names))
+        if data.group_task_counts[group] == 2 and data.group_candidates[group]
+    ]
+    pair_groups.sort(key=lambda g: (data.group_candidates[g][0].singleton_penalty, data.group_names[g]))
+    pair_groups = pair_groups[:PAIR_REPLACEMENT_CANDIDATE_LIMIT]
+
+    for _ in range(PAIR_REPLACEMENT_ROUNDS):
+        approximate = []
+        for pair_group in pair_groups:
+            if pair_group in state.active:
+                continue
+            candidate = pair_replacement_state(
+                state,
+                pair_group,
+                single_group_by_mask,
+                do_polish=False,
+            )
+            if candidate is not None:
+                approximate.append((candidate.total_penalty - state.total_penalty, pair_group))
+
+        if not approximate:
+            break
+
+        approximate.sort()
+        best = None
+        best_delta = -EPS
+        for _, pair_group in approximate[:PAIR_REPLACEMENT_SHORTLIST]:
+            candidate = pair_replacement_state(
+                state,
+                pair_group,
+                single_group_by_mask,
+                do_polish=True,
+            )
+            if candidate is None:
+                continue
+            delta = candidate.total_penalty - state.total_penalty
+            if delta < best_delta:
+                best_delta = delta
+                best = candidate
+
+        if best is None:
+            break
+
+        restore_state(state, best)
+
+
+def pair_replacement_state(
+    state: State,
+    pair_group: int,
+    single_group_by_mask: dict,
+    do_polish: bool,
+):
+    groups_to_remove = active_single_groups_for_pair(
+        state,
+        pair_group,
+        single_group_by_mask,
+    )
+    if groups_to_remove is None:
+        return None
+
+    candidate = clone_state(state)
+    for group in groups_to_remove:
+        remove_group(candidate, group)
+
+    courier = best_available_seed_courier(candidate, pair_group)
+    if courier is None:
+        return None
+
+    add_courier(candidate, pair_group, courier)
+    allocate_remaining_couriers_by_gain(candidate)
+    if do_polish:
+        polish_courier_assignment(candidate)
+    return candidate
+
+
+def active_single_groups_for_pair(
+    state: State,
+    pair_group: int,
+    single_group_by_mask: dict,
+):
+    data = state.data
+    groups = []
+    bit = 1
+    pair_mask = data.group_masks[pair_group]
+
+    while bit <= data.task_full_mask:
+        if pair_mask & bit:
+            group = single_group_by_mask.get(bit)
+            if group is None or group not in state.active:
+                return None
+            groups.append(group)
+        bit <<= 1
+
+    if len(groups) != 2:
+        return None
+    return groups
+
+
+def clone_state(state: State) -> State:
+    clone = State(state.data)
+    for group in sorted(state.active):
+        for courier in sorted(state.assigned[group]):
+            add_courier(clone, group, courier)
+    return clone
+
+
+def restore_state(target: State, source: State) -> None:
+    target.active = set(source.active)
+    target.assigned = [couriers.copy() for couriers in source.assigned]
+    target.owner = source.owner[:]
+    target.sum_w = source.sum_w[:]
+    target.sum_ws = source.sum_ws[:]
+    target.reject_prod = source.reject_prod[:]
+    target.zero_rejects = source.zero_rejects[:]
+    target.group_penalty = source.group_penalty[:]
+    target.task_mask = source.task_mask
+    target.covered_count = source.covered_count
+    target.total_penalty = source.total_penalty
+
+
+def remove_group(state: State, group: int) -> None:
+    for courier in list(state.assigned[group]):
+        remove_courier(state, group, courier)
+
+
+def polish_three_courier_cycles(state: State) -> int:
+    if len(state.active) > THREE_CYCLE_MAX_ACTIVE_GROUPS:
+        return 0
+
+    moves = 0
+    for _ in range(THREE_CYCLE_MOVE_LIMIT):
+        move = best_three_courier_cycle(state)
+        if move is None:
+            return moves
+        apply_three_courier_cycle(state, move)
+        polish_courier_assignment(state)
+        moves += 1
+    return moves
+
+
+def best_three_courier_cycle(state: State):
+    data = state.data
+    active = sorted(state.active, key=lambda g: data.group_names[g])
+    best_delta = -EPS
+    best_move = None
+
+    for i, group_a in enumerate(active):
+        for j in range(i + 1, len(active)):
+            group_b = active[j]
+            for group_c in active[j + 1 :]:
+                old_penalty = (
+                    state.group_penalty[group_a]
+                    + state.group_penalty[group_b]
+                    + state.group_penalty[group_c]
+                )
+
+                for courier_a in sorted(state.assigned[group_a]):
+                    for courier_b in sorted(state.assigned[group_b]):
+                        for courier_c in sorted(state.assigned[group_c]):
+                            if (
+                                courier_a in data.cand_by_group[group_b]
+                                and courier_b in data.cand_by_group[group_c]
+                                and courier_c in data.cand_by_group[group_a]
+                            ):
+                                delta = three_cycle_delta(
+                                    state,
+                                    group_a,
+                                    group_b,
+                                    group_c,
+                                    courier_a,
+                                    courier_b,
+                                    courier_c,
+                                    old_penalty,
+                                    0,
+                                )
+                                if delta < best_delta:
+                                    best_delta = delta
+                                    best_move = (
+                                        group_a,
+                                        group_b,
+                                        group_c,
+                                        courier_a,
+                                        courier_b,
+                                        courier_c,
+                                        0,
+                                    )
+
+                            if (
+                                courier_a in data.cand_by_group[group_c]
+                                and courier_c in data.cand_by_group[group_b]
+                                and courier_b in data.cand_by_group[group_a]
+                            ):
+                                delta = three_cycle_delta(
+                                    state,
+                                    group_a,
+                                    group_b,
+                                    group_c,
+                                    courier_a,
+                                    courier_b,
+                                    courier_c,
+                                    old_penalty,
+                                    1,
+                                )
+                                if delta < best_delta:
+                                    best_delta = delta
+                                    best_move = (
+                                        group_a,
+                                        group_b,
+                                        group_c,
+                                        courier_a,
+                                        courier_b,
+                                        courier_c,
+                                        1,
+                                    )
+
+    return best_move
+
+
+def three_cycle_delta(
+    state: State,
+    group_a: int,
+    group_b: int,
+    group_c: int,
+    courier_a: int,
+    courier_b: int,
+    courier_c: int,
+    old_penalty: float,
+    mode: int,
+) -> float:
+    if mode == 0:
+        new_a = (state.assigned[group_a] - {courier_a}) | {courier_c}
+        new_b = (state.assigned[group_b] - {courier_b}) | {courier_a}
+        new_c = (state.assigned[group_c] - {courier_c}) | {courier_b}
+    else:
+        new_a = (state.assigned[group_a] - {courier_a}) | {courier_b}
+        new_b = (state.assigned[group_b] - {courier_b}) | {courier_c}
+        new_c = (state.assigned[group_c] - {courier_c}) | {courier_a}
+
+    new_penalty = (
+        penalty_for_courier_set(state.data, group_a, new_a)
+        + penalty_for_courier_set(state.data, group_b, new_b)
+        + penalty_for_courier_set(state.data, group_c, new_c)
+    )
+    return new_penalty - old_penalty
+
+
+def apply_three_courier_cycle(state: State, move) -> None:
+    group_a, group_b, group_c, courier_a, courier_b, courier_c, mode = move
+
+    remove_courier(state, group_a, courier_a)
+    remove_courier(state, group_b, courier_b)
+    remove_courier(state, group_c, courier_c)
+
+    if mode == 0:
+        add_courier(state, group_a, courier_c)
+        add_courier(state, group_b, courier_a)
+        add_courier(state, group_c, courier_b)
+    else:
+        add_courier(state, group_a, courier_b)
+        add_courier(state, group_b, courier_c)
+        add_courier(state, group_c, courier_a)
 
 
 def singleton_penalty(fallback: float, score: float, willingness: float) -> float:
     return (1.0 - willingness) * fallback + willingness * score
 
 
-def state_key(state):
-    return (-state.covered_count, state.total_penalty)
-
-
-def better(a: State, b) -> bool:
-    if b is None:
-        return True
-    if a.covered_count != b.covered_count:
-        return a.covered_count > b.covered_count
-    return a.total_penalty + EPS < b.total_penalty
+def penalty_from_stats(
+    fallback: float,
+    sum_w: float,
+    sum_ws: float,
+    reject_prod: float,
+    zero_rejects: int,
+) -> float:
+    if sum_w <= EPS:
+        return fallback
+    reject_prob = 0.0 if zero_rejects > 0 else reject_prod
+    accepted_score = sum_ws / sum_w
+    return reject_prob * fallback + (1.0 - reject_prob) * accepted_score
 
 
 def group_penalty_from_stats(
@@ -433,11 +759,32 @@ def group_penalty_from_stats(
     reject_prod: float,
     zero_rejects: int,
 ) -> float:
-    if sum_w <= EPS:
-        return data.group_fallbacks[group]
-    reject_prob = 0.0 if zero_rejects > 0 else reject_prod
-    accepted_score = sum_ws / sum_w
-    return reject_prob * data.group_fallbacks[group] + (1.0 - reject_prob) * accepted_score
+    return penalty_from_stats(
+        data.group_fallbacks[group],
+        sum_w,
+        sum_ws,
+        reject_prod,
+        zero_rejects,
+    )
+
+
+def penalty_for_courier_set(data: ProblemData, group: int, couriers) -> float:
+    sum_w = 0.0
+    sum_ws = 0.0
+    reject_prod = 1.0
+    zero_rejects = 0
+
+    for courier in couriers:
+        score, willingness = data.cand_by_group[group][courier]
+        sum_w += willingness
+        sum_ws += willingness * score
+        reject_factor = 1.0 - willingness
+        if reject_factor <= EPS:
+            zero_rejects += 1
+        else:
+            reject_prod *= reject_factor
+
+    return group_penalty_from_stats(data, group, sum_w, sum_ws, reject_prod, zero_rejects)
 
 
 def penalty_after_add(state: State, group: int, courier: int) -> float:
@@ -452,7 +799,12 @@ def penalty_after_add(state: State, group: int, courier: int) -> float:
     else:
         reject_prod *= reject_factor
     return group_penalty_from_stats(
-        state.data, group, sum_w, sum_ws, reject_prod, zero_rejects
+        state.data,
+        group,
+        sum_w,
+        sum_ws,
+        reject_prod,
+        zero_rejects,
     )
 
 
@@ -468,32 +820,12 @@ def penalty_after_remove(state: State, group: int, courier: int) -> float:
     else:
         reject_prod /= reject_factor
     return group_penalty_from_stats(
-        state.data, group, sum_w, sum_ws, reject_prod, zero_rejects
-    )
-
-
-def penalty_after_replace(state: State, group: int, old_c: int, new_c: int) -> float:
-    score_old, w_old = state.data.cand_by_group[group][old_c]
-    score_new, w_new = state.data.cand_by_group[group][new_c]
-    sum_w = state.sum_w[group] - w_old + w_new
-    sum_ws = state.sum_ws[group] - w_old * score_old + w_new * score_new
-    zero_rejects = state.zero_rejects[group]
-    reject_prod = state.reject_prod[group]
-
-    old_factor = 1.0 - w_old
-    if old_factor <= EPS:
-        zero_rejects -= 1
-    else:
-        reject_prod /= old_factor
-
-    new_factor = 1.0 - w_new
-    if new_factor <= EPS:
-        zero_rejects += 1
-    else:
-        reject_prod *= new_factor
-
-    return group_penalty_from_stats(
-        state.data, group, sum_w, sum_ws, reject_prod, zero_rejects
+        state.data,
+        group,
+        sum_w,
+        sum_ws,
+        reject_prod,
+        zero_rejects,
     )
 
 
@@ -515,6 +847,7 @@ def add_courier(state: State, group: int, courier: int) -> None:
         state.zero_rejects[group] += 1
     else:
         state.reject_prod[group] *= reject_factor
+
     new_penalty = group_penalty_from_stats(
         data,
         group,
@@ -563,683 +896,6 @@ def remove_courier(state: State, group: int, courier: int) -> None:
     )
     state.group_penalty[group] = new_penalty
     state.total_penalty += new_penalty - old_penalty
-
-
-def replace_courier(state: State, group: int, old_c: int, new_c: int) -> None:
-    remove_courier(state, group, old_c)
-    add_courier(state, group, new_c)
-
-
-def remove_group(state: State, group: int):
-    couriers = list(state.assigned[group])
-    for courier in couriers:
-        remove_courier(state, group, courier)
-    return couriers
-
-
-def construct_initial_solution(
-    data: ProblemData, rng: random.Random, restart_id: int
-) -> State:
-    state = State(data)
-    groups = list(range(len(data.group_names)))
-
-    def group_key(g: int) -> float:
-        best = data.group_candidates[g][0].singleton_penalty
-        ratio = best / max(1, data.group_task_counts[g])
-        noise = rng.random() * (
-            INITIAL_NOISE_BASE
-            + INITIAL_NOISE_RESTART_SCALE
-            * (restart_id % INITIAL_NOISE_RESTART_PERIOD)
-        )
-        return ratio - INITIAL_TASK_COUNT_BONUS * data.group_task_counts[g] + noise
-
-    groups.sort(key=group_key)
-
-    for group in groups:
-        if state.task_mask & data.group_masks[group]:
-            continue
-        courier = choose_initial_courier(state, group, rng)
-        if courier is None:
-            continue
-        add_courier(state, group, courier)
-
-    return state
-
-
-def choose_initial_courier(
-    state: State, group: int, rng: random.Random, pool=None
-):
-    options = []
-    for cand in state.data.group_candidates[group][:INITIAL_TOP_CANDIDATES]:
-        c = cand.courier
-        if state.owner[c] == -1 and (pool is None or c in pool):
-            options.append(c)
-    if not options:
-        for cand in state.data.group_candidates[group]:
-            c = cand.courier
-            if state.owner[c] == -1 and (pool is None or c in pool):
-                return c
-        return None
-
-    if rng.random() < INITIAL_GREEDY_CHOICE_PROB or len(options) == 1:
-        return options[0]
-    return rng.choice(options[: min(INITIAL_RANDOM_CHOICE_LIMIT, len(options))])
-
-
-def greedy_warmup(
-    state: State, rng: random.Random, move_limit: int, deadline: float
-) -> None:
-    moves = 0
-    while moves < move_limit and time.perf_counter() < deadline:
-        best_move = None
-        best_delta = -EPS
-
-        active_groups = list(state.active)
-        rng.shuffle(active_groups)
-        for group in active_groups[
-            : min(len(active_groups), WARMUP_GROUP_SAMPLE_LIMIT)
-        ]:
-            move = best_add_move_for_group(
-                state, group, limit=WARMUP_ADD_CANDIDATE_LIMIT
-            )
-            if move is not None and move[0] < best_delta:
-                best_delta = move[0]
-                best_move = ("add", group, move[1])
-
-            move = best_replace_move_for_group(
-                state, group, limit=WARMUP_REPLACE_CANDIDATE_LIMIT
-            )
-            if move is not None and move[0] < best_delta:
-                best_delta = move[0]
-                best_move = ("replace_courier", group, move[1], move[2])
-
-        if best_move is None:
-            move = best_activate_move(state, rng, sample=WARMUP_ACTIVATE_SAMPLE)
-            if move is not None:
-                best_move = ("activate", move[1], move[2])
-
-        if best_move is None:
-            break
-
-        apply_move(state, best_move)
-        moves += 1
-
-
-def best_add_move_for_group(
-    state: State, group: int, limit: int
-):
-    best_delta = 0.0
-    best_c = -1
-    checked = 0
-    for cand in state.data.group_candidates[group]:
-        c = cand.courier
-        if state.owner[c] != -1 or c in state.assigned[group]:
-            continue
-        new_penalty = penalty_after_add(state, group, c)
-        delta = new_penalty - state.group_penalty[group]
-        if delta < best_delta:
-            best_delta = delta
-            best_c = c
-        checked += 1
-        if checked >= limit:
-            break
-    if best_c == -1:
-        return None
-    return best_delta, best_c
-
-
-def best_replace_move_for_group(
-    state: State, group: int, limit: int
-):
-    if len(state.assigned[group]) <= 0:
-        return None
-    best_delta = 0.0
-    best_old = -1
-    best_new = -1
-    free_checked = 0
-    free_candidates = []
-    for cand in state.data.group_candidates[group]:
-        c = cand.courier
-        if state.owner[c] == -1 and c not in state.assigned[group]:
-            free_candidates.append(c)
-            free_checked += 1
-            if free_checked >= limit:
-                break
-    if not free_candidates:
-        return None
-    for old_c in list(state.assigned[group]):
-        for new_c in free_candidates:
-            new_penalty = penalty_after_replace(state, group, old_c, new_c)
-            delta = new_penalty - state.group_penalty[group]
-            if delta < best_delta:
-                best_delta = delta
-                best_old = old_c
-                best_new = new_c
-    if best_old == -1:
-        return None
-    return best_delta, best_old, best_new
-
-
-def best_activate_move(
-    state: State, rng: random.Random, sample: int
-):
-    data = state.data
-    best_delta = 0.0
-    best_group = -1
-    best_courier = -1
-    n = len(data.group_names)
-    for _ in range(min(sample, n)):
-        group = rng.randrange(n)
-        if group in state.active or (state.task_mask & data.group_masks[group]):
-            continue
-        courier = choose_initial_courier(state, group, rng)
-        if courier is None:
-            continue
-        new_penalty = penalty_after_add_to_empty(state, group, courier)
-        delta = new_penalty - BIG * data.group_task_counts[group]
-        if delta < best_delta:
-            best_delta = delta
-            best_group = group
-            best_courier = courier
-    if best_group == -1:
-        return None
-    return best_delta, best_group, best_courier
-
-
-def penalty_after_add_to_empty(state: State, group: int, courier: int) -> float:
-    score, willingness = state.data.cand_by_group[group][courier]
-    reject_factor = 1.0 - willingness
-    zero_rejects = 1 if reject_factor <= EPS else 0
-    reject_prod = 1.0 if zero_rejects else reject_factor
-    return group_penalty_from_stats(
-        state.data,
-        group,
-        willingness,
-        willingness * score,
-        reject_prod,
-        zero_rejects,
-    )
-
-
-def generate_move(
-    state: State,
-    best: State,
-    arm: str,
-    tabu: TabuTable,
-    confchange: ConfChange,
-    iter_id: int,
-    rng: random.Random,
-):
-    generators = {
-        "add": generate_add_move,
-        "remove": generate_remove_move,
-        "replace_courier": generate_replace_courier_move,
-        "activate": generate_activate_move,
-        "replace_group": generate_replace_group_move,
-    }
-    return generators[arm](state, best, tabu, confchange, iter_id, rng)
-
-
-def generate_add_move(state, best, tabu, confchange, iter_id, rng):
-    best_move = None
-    best_delta = float("inf")
-    groups = list(state.active)
-    if not groups:
-        return None
-    for _ in range(ADD_MOVE_TRIALS):
-        group = rng.choice(groups)
-        if not confchange.group[group] and rng.random() < GROUP_CONFCHANGE_SKIP_PROB:
-            continue
-        candidates = state.data.group_candidates[group]
-        if not candidates:
-            continue
-        cand = candidates[
-            rng.randrange(min(len(candidates), ADD_MOVE_CANDIDATE_POOL))
-        ]
-        c = cand.courier
-        if state.owner[c] != -1 or c in state.assigned[group]:
-            continue
-        delta = penalty_after_add(state, group, c) - state.group_penalty[group]
-        move = ("add", group, c)
-        if is_tabu(move, tabu, iter_id) and not aspiration(state, best, delta, 0):
-            continue
-        if delta < best_delta:
-            best_delta = delta
-            best_move = move
-    return best_move
-
-
-def generate_remove_move(state, best, tabu, confchange, iter_id, rng):
-    groups = [g for g in state.active if len(state.assigned[g]) > 1]
-    if not groups:
-        return None
-    best_move = None
-    best_delta = float("inf")
-    for _ in range(REMOVE_MOVE_TRIALS):
-        group = rng.choice(groups)
-        if not confchange.group[group] and rng.random() < GROUP_CONFCHANGE_SKIP_PROB:
-            continue
-        c = rng.choice(tuple(state.assigned[group]))
-        delta = penalty_after_remove(state, group, c) - state.group_penalty[group]
-        move = ("remove", group, c)
-        if is_tabu(move, tabu, iter_id) and not aspiration(state, best, delta, 0):
-            continue
-        if delta < best_delta:
-            best_delta = delta
-            best_move = move
-    return best_move
-
-
-def generate_replace_courier_move(state, best, tabu, confchange, iter_id, rng):
-    groups = list(state.active)
-    if not groups:
-        return None
-    best_move = None
-    best_delta = float("inf")
-    for _ in range(REPLACE_COURIER_MOVE_TRIALS):
-        group = rng.choice(groups)
-        if not state.assigned[group]:
-            continue
-        if not confchange.group[group] and rng.random() < GROUP_CONFCHANGE_SKIP_PROB:
-            continue
-        old_c = rng.choice(tuple(state.assigned[group]))
-        candidates = state.data.group_candidates[group]
-        for _ in range(REPLACE_COURIER_INNER_TRIALS):
-            cand = candidates[
-                rng.randrange(min(len(candidates), REPLACE_COURIER_CANDIDATE_POOL))
-            ]
-            new_c = cand.courier
-            if state.owner[new_c] != -1 or new_c in state.assigned[group]:
-                continue
-            delta = (
-                penalty_after_replace(state, group, old_c, new_c)
-                - state.group_penalty[group]
-            )
-            move = ("replace_courier", group, old_c, new_c)
-            if is_tabu(move, tabu, iter_id) and not aspiration(state, best, delta, 0):
-                continue
-            if delta < best_delta:
-                best_delta = delta
-                best_move = move
-    return best_move
-
-
-def generate_activate_move(state, best, tabu, confchange, iter_id, rng):
-    data = state.data
-    best_move = None
-    best_delta = float("inf")
-    for _ in range(ACTIVATE_MOVE_TRIALS):
-        group = rng.randrange(len(data.group_names))
-        if group in state.active or (state.task_mask & data.group_masks[group]):
-            continue
-        if not confchange.group[group] and rng.random() < ACTIVATE_CONFCHANGE_SKIP_PROB:
-            continue
-        courier = choose_initial_courier(state, group, rng)
-        if courier is None:
-            continue
-        penalty = penalty_after_add_to_empty(state, group, courier)
-        delta = penalty - BIG * data.group_task_counts[group]
-        move = ("activate", group, courier)
-        if is_tabu(move, tabu, iter_id) and not aspiration(
-            state, best, delta, data.group_task_counts[group]
-        ):
-            continue
-        if delta < best_delta:
-            best_delta = delta
-            best_move = move
-    return best_move
-
-
-def generate_replace_group_move(state, best, tabu, confchange, iter_id, rng):
-    data = state.data
-    best_move = None
-    best_delta = float("inf")
-    for _ in range(REPLACE_GROUP_MOVE_TRIALS):
-        group = rng.randrange(len(data.group_names))
-        if group in state.active:
-            continue
-        if not confchange.group[group] and rng.random() < ACTIVATE_CONFCHANGE_SKIP_PROB:
-            continue
-        conflicts = [
-            g for g in state.active if data.group_masks[g] & data.group_masks[group]
-        ]
-        if not conflicts:
-            continue
-
-        freed = set()
-        removed_penalty = 0.0
-        removed_mask = 0
-        for old_g in conflicts:
-            freed.update(state.assigned[old_g])
-            removed_penalty += state.group_penalty[old_g]
-            removed_mask |= data.group_masks[old_g]
-
-        courier = choose_initial_courier_after_removal(state, group, freed)
-        if courier is None:
-            continue
-        penalty = penalty_after_add_to_empty_for_courier(data, group, courier)
-        old_covered = state.covered_count
-        new_mask = (state.task_mask & ~removed_mask) | data.group_masks[group]
-        delta_covered = popcount(new_mask) - old_covered
-        delta = penalty - removed_penalty - BIG * delta_covered
-        move = ("replace_group", group, courier, tuple(conflicts))
-        if is_tabu(move, tabu, iter_id) and not aspiration(state, best, delta, delta_covered):
-            continue
-        if delta < best_delta:
-            best_delta = delta
-            best_move = move
-    return best_move
-
-
-def choose_initial_courier_after_removal(
-    state: State, group: int, freed
-):
-    for cand in state.data.group_candidates[group]:
-        c = cand.courier
-        if state.owner[c] == -1 or c in freed:
-            return c
-    return None
-
-
-def penalty_after_add_to_empty_for_courier(
-    data: ProblemData, group: int, courier: int
-) -> float:
-    score, willingness = data.cand_by_group[group][courier]
-    reject_factor = 1.0 - willingness
-    zero_rejects = 1 if reject_factor <= EPS else 0
-    reject_prod = 1.0 if zero_rejects else reject_factor
-    return group_penalty_from_stats(
-        data,
-        group,
-        willingness,
-        willingness * score,
-        reject_prod,
-        zero_rejects,
-    )
-
-
-def is_tabu(move, tabu: TabuTable, iter_id: int) -> bool:
-    kind = move[0]
-    if kind in ("add", "activate"):
-        group, c = move[1], move[2]
-        return (
-            tabu.courier_group.get((c, group), -1) > iter_id
-            or tabu.group_add.get(group, -1) > iter_id
-        )
-    if kind == "replace_courier":
-        group, _, new_c = move[1], move[2], move[3]
-        return tabu.courier_group.get((new_c, group), -1) > iter_id
-    if kind == "remove":
-        group = move[1]
-        return tabu.group_remove.get(group, -1) > iter_id
-    if kind == "replace_group":
-        group = move[1]
-        return tabu.group_add.get(group, -1) > iter_id
-    return False
-
-
-def aspiration(state: State, best: State, delta_energy: float, delta_covered: int) -> bool:
-    new_covered = state.covered_count + delta_covered
-    new_penalty = state.total_penalty + delta_energy + BIG * delta_covered
-    if new_covered != best.covered_count:
-        return new_covered > best.covered_count
-    return new_penalty + EPS < best.total_penalty
-
-
-def apply_move(state: State, move) -> None:
-    kind = move[0]
-    if kind == "add":
-        _, group, c = move
-        add_courier(state, group, c)
-    elif kind == "remove":
-        _, group, c = move
-        remove_courier(state, group, c)
-    elif kind == "replace_courier":
-        _, group, old_c, new_c = move
-        replace_courier(state, group, old_c, new_c)
-    elif kind == "activate":
-        _, group, c = move
-        add_courier(state, group, c)
-    elif kind == "replace_group":
-        _, group, c, conflicts = move
-        for old_g in conflicts:
-            if old_g in state.active:
-                remove_group(state, old_g)
-        add_courier(state, group, c)
-
-
-def update_tabu(tabu: TabuTable, move, iter_id: int, rng: random.Random) -> None:
-    tenure = TABU_TENURE_BASE + rng.randrange(TABU_TENURE_SPAN)
-    kind = move[0]
-    if kind == "add":
-        _, group, c = move
-        tabu.group_remove[group] = iter_id + tenure
-    elif kind == "activate":
-        _, group, c = move
-        tabu.group_remove[group] = iter_id + tenure
-    elif kind == "remove":
-        _, group, c = move
-        tabu.courier_group[(c, group)] = iter_id + tenure
-    elif kind == "replace_courier":
-        _, group, old_c, _ = move
-        tabu.courier_group[(old_c, group)] = iter_id + tenure
-    elif kind == "replace_group":
-        _, group, c, conflicts = move
-        tabu.group_remove[group] = iter_id + tenure
-        for old_g in conflicts:
-            tabu.group_add[old_g] = iter_id + tenure
-
-
-def update_confchange(confchange: ConfChange, move) -> None:
-    kind = move[0]
-    if kind in ("add", "remove", "activate"):
-        _, group, c = move
-        confchange.touch([group], [c])
-    elif kind == "replace_courier":
-        _, group, old_c, new_c = move
-        confchange.touch([group], [old_c, new_c])
-    elif kind == "replace_group":
-        _, group, c, conflicts = move
-        confchange.touch([group] + list(conflicts), [c])
-
-
-def ruin_recreate(state: State, rng: random.Random, deadline: float) -> None:
-    data = state.data
-    old_energy = state.energy
-    snapshot = state.copy()
-
-    if state.active:
-        seed_group = rng.choice(tuple(state.active))
-        region_mask = data.group_masks[seed_group]
-    else:
-        region_mask = 0
-
-    task_ids = list(range(data.total_tasks))
-    rng.shuffle(task_ids)
-    ruin_sample_limit = rng.randrange(
-        RUIN_TASK_SAMPLE_MIN,
-        min(
-            RUIN_TASK_SAMPLE_MAX_EXCLUSIVE,
-            max(RUIN_TASK_SAMPLE_FLOOR, data.total_tasks + 1),
-        ),
-    )
-    for t in task_ids[:ruin_sample_limit]:
-        region_mask |= 1 << t
-
-    to_remove = [g for g in list(state.active) if data.group_masks[g] & region_mask]
-    rng.shuffle(to_remove)
-    for group in to_remove[:RUIN_REMOVE_GROUP_LIMIT]:
-        remove_group(state, group)
-
-    candidates = [
-        g
-        for g in range(len(data.group_names))
-        if g not in state.active
-        and (data.group_masks[g] & region_mask)
-        and not (state.task_mask & data.group_masks[g])
-    ]
-    candidates.sort(
-        key=lambda g: (
-            data.group_candidates[g][0].singleton_penalty
-            / max(1, data.group_task_counts[g])
-            + rng.random() * RUIN_CANDIDATE_NOISE
-        )
-    )
-
-    for group in candidates[:RUIN_CANDIDATE_LIMIT]:
-        if time.perf_counter() >= deadline:
-            break
-        if state.task_mask & data.group_masks[group]:
-            continue
-        c = choose_initial_courier(state, group, rng)
-        if c is not None:
-            add_courier(state, group, c)
-
-    greedy_warmup(state, rng, move_limit=RUIN_GREEDY_MOVE_LIMIT, deadline=deadline)
-
-    if (
-        state.energy > old_energy + RUIN_RESTORE_ENERGY_SLACK
-        and rng.random() < RUIN_RESTORE_PROB
-    ):
-        restore_state(state, snapshot)
-
-
-def deepopt(state: State, rng: random.Random, deadline: float) -> None:
-    data = state.data
-    old = state.copy()
-    old_energy = state.energy
-
-    if state.active:
-        active_groups = list(state.active)
-        active_groups.sort(
-            key=lambda g: state.group_penalty[g] / max(1, data.group_task_counts[g]),
-            reverse=True,
-        )
-        region_mask = 0
-        deepopt_group_limit = rng.randrange(
-            DEEPOPT_GROUP_SAMPLE_MIN,
-            min(DEEPOPT_GROUP_SAMPLE_MAX_EXCLUSIVE, len(active_groups) + 1),
-        )
-        for g in active_groups[:deepopt_group_limit]:
-            region_mask |= data.group_masks[g]
-    else:
-        region_mask = 0
-
-    all_tasks = list(range(data.total_tasks))
-    rng.shuffle(all_tasks)
-    for t in all_tasks[:DEEPOPT_EXTRA_TASKS]:
-        region_mask |= 1 << t
-
-    removed_groups = [
-        g for g in list(state.active) if data.group_masks[g] & region_mask
-    ]
-    freed_couriers = set()
-    freed_mask = 0
-    for group in removed_groups:
-        freed_couriers.update(state.assigned[group])
-        freed_mask |= data.group_masks[group]
-        remove_group(state, group)
-
-    outside_mask = state.task_mask
-    available_couriers = {c for c, owner in enumerate(state.owner) if owner == -1}
-    available_couriers.update(freed_couriers)
-
-    candidate_groups = []
-    for group in range(len(data.group_names)):
-        mask = data.group_masks[group]
-        if mask & outside_mask:
-            continue
-        if not (mask & freed_mask):
-            continue
-        if mask | freed_mask != freed_mask:
-            continue
-        c = first_available_candidate(data, group, available_couriers)
-        if c is None:
-            continue
-        penalty = penalty_after_add_to_empty_for_courier(data, group, c)
-        candidate_groups.append(
-            (penalty - BIG * data.group_task_counts[group], group)
-        )
-
-    candidate_groups.sort(key=lambda x: x[0])
-    candidate_groups = candidate_groups[:DEEPOPT_CANDIDATE_LIMIT]
-
-    beam = [(0.0, 0, 0, [])]  # local energy, task mask, courier mask, [(g, c)]
-    for _, group in candidate_groups:
-        if time.perf_counter() + DEEPOPT_STEP_TIME_MARGIN >= deadline:
-            break
-        next_beam = beam[:]
-        gmask = data.group_masks[group]
-        for energy, used_mask, used_cmask, chosen in beam:
-            if used_mask & gmask:
-                continue
-            c = first_available_candidate_excluding(
-                data, group, available_couriers, used_cmask
-            )
-            if c is None:
-                continue
-            cmask = 1 << c
-            penalty = penalty_after_add_to_empty_for_courier(data, group, c)
-            local_energy = energy + penalty - BIG * data.group_task_counts[group]
-            next_beam.append(
-                (
-                    local_energy,
-                    used_mask | gmask,
-                    used_cmask | cmask,
-                    chosen + [(group, c)],
-                )
-            )
-        next_beam.sort(key=lambda x: x[0])
-        beam = next_beam[:DEEPOPT_BEAM_WIDTH]
-
-    best_local = min(beam, key=lambda x: x[0], default=None)
-    if best_local is not None:
-        for group, c in best_local[3]:
-            if group not in state.active and not (
-                state.task_mask & data.group_masks[group]
-            ):
-                if state.owner[c] == -1:
-                    add_courier(state, group, c)
-
-    greedy_warmup(
-        state, rng, move_limit=DEEPOPT_FINAL_GREEDY_MOVE_LIMIT, deadline=deadline
-    )
-
-    if state.energy > old_energy + EPS:
-        restore_state(state, old)
-
-
-def first_available_candidate(
-    data: ProblemData, group: int, available
-):
-    for cand in data.group_candidates[group]:
-        if cand.courier in available:
-            return cand.courier
-    return None
-
-
-def first_available_candidate_excluding(
-    data: ProblemData, group: int, available, used_cmask: int
-):
-    for cand in data.group_candidates[group]:
-        c = cand.courier
-        if c in available and not (used_cmask & (1 << c)):
-            return c
-    return None
-
-
-def restore_state(target: State, source: State) -> None:
-    target.active = set(source.active)
-    target.assigned = [s.copy() for s in source.assigned]
-    target.owner = source.owner[:]
-    target.sum_w = source.sum_w[:]
-    target.sum_ws = source.sum_ws[:]
-    target.reject_prod = source.reject_prod[:]
-    target.zero_rejects = source.zero_rejects[:]
-    target.group_penalty = source.group_penalty[:]
-    target.task_mask = source.task_mask
-    target.covered_count = source.covered_count
-    target.total_penalty = source.total_penalty
 
 
 def format_solution(state: State) -> list:
