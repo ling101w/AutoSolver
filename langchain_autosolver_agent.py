@@ -304,11 +304,29 @@ class AgentContext:
         deadline: float,
         rng: random.Random,
         verbose: bool = True,
+        search_per_case_timeout: Optional[float] = None,
+        final_solver_time_limit: float = 8.75,
+        finalize_top_k: int = 3,
     ) -> None:
         self.cases = cases
         self.seed = seed
+        # 判题机等价超时 (默认 10s); 仅用于 Top-K 复选 / final 渲染.
         self.per_case_timeout = per_case_timeout
+        # 搜索期超时 (默认与判题一致); 调小则可跳更多迭代.
+        self.search_per_case_timeout = search_per_case_timeout or per_case_timeout
+        self.final_solver_time_limit = final_solver_time_limit
+        self.finalize_top_k = max(1, finalize_top_k)
         self.deadline = deadline
+        # 为 finalize 复选预留预算: top_k × case × 判题超时 + reference 评估 + 冗余.
+        finalize_reserve = (
+            self.finalize_top_k * len(cases) * per_case_timeout
+            + len(cases) * per_case_timeout
+            + 2.0
+        )
+        total_budget = max(0.0, deadline - time.time())
+        if finalize_reserve > total_budget * 0.6:
+            finalize_reserve = max(per_case_timeout * len(cases) + 2.0, total_budget * 0.4)
+        self.search_deadline = max(time.time() + 1.0, deadline - finalize_reserve)
         self.rng = rng
         self.verbose = verbose
         self.parsed_cases: List[Dict[str, Any]] = [parse_case(c["text"]) for c in cases]
@@ -324,7 +342,14 @@ class AgentContext:
     def time_left(self) -> float:
         return max(0.0, self.deadline - time.time())
 
+    def search_time_left(self) -> float:
+        return max(0.0, self.search_deadline - time.time())
+
     def out_of_time(self, margin: float = 0.5) -> bool:
+        """默认检查搜索期截止时间 (不含 finalize 复选)."""
+        return time.time() + margin >= self.search_deadline
+
+    def out_of_total_time(self, margin: float = 0.5) -> bool:
         return time.time() + margin >= self.deadline
 
     def log(self, msg: str) -> None:
@@ -370,8 +395,14 @@ class AgentContext:
         self.pending.append(strategy)
         return True
 
-    def evaluate_strategy(self, strategy: Dict[str, Any]) -> Dict[str, Any]:
+    def evaluate_strategy(
+        self,
+        strategy: Dict[str, Any],
+        timeout: Optional[float] = None,
+        track: bool = True,
+    ) -> Dict[str, Any]:
         code = strategy["code"]
+        per_case = timeout if timeout is not None else self.search_per_case_timeout
         case_results: List[Dict[str, Any]] = []
         total_covered = 0
         total_tasks = 0
@@ -379,7 +410,7 @@ class AgentContext:
         total_runtime = 0.0
         failures = 0
         for case, parsed in zip(self.cases, self.parsed_cases):
-            run = run_candidate(code, case["text"], self.per_case_timeout)
+            run = run_candidate(code, case["text"], per_case)
             total_tasks += len(parsed["all_tasks"])
             if run["status"] != "ok":
                 failures += 1
@@ -413,14 +444,16 @@ class AgentContext:
             "total_covered": total_covered, "total_tasks": total_tasks,
             "total_penalty": total_penalty, "total_runtime": total_runtime,
             "failures": failures,
+            "timeout_used": per_case,
         }
-        self.history.append(result)
-        if self.best is None or rank < self.best["rank"]:
-            self.best = result
-            self.log(
-                f"new best: {strategy['name']} covered={total_covered}/{total_tasks} "
-                f"penalty={total_penalty:.2f}"
-            )
+        if track:
+            self.history.append(result)
+            if self.best is None or rank < self.best["rank"]:
+                self.best = result
+                self.log(
+                    f"new best: {strategy['name']} covered={total_covered}/{total_tasks} "
+                    f"penalty={total_penalty:.2f} (timeout={per_case:.1f}s)"
+                )
         return result
 
     def evaluate_reference(self, path: Optional[str]) -> None:
@@ -434,12 +467,78 @@ class AgentContext:
             with open(path, "r") as handle:
                 code = handle.read()
             strategy = {"name": "reference", "config": {"reference": True}, "code": code}
-            result = self.evaluate_strategy(strategy)
+            # 参考求解器仅用作基线对比: 不进入 best 竞争也不进 history.
+            result = self.evaluate_strategy(
+                strategy, timeout=self.per_case_timeout, track=False
+            )
             self.reference = result
             self.log(f"reference baseline penalty={result['total_penalty']:.2f}")
         except Exception as exc:
             self.log(f"reference evaluation failed: {exc}")
             self.reference = None
+
+    def finalize_best(self) -> Optional[Dict[str, Any]]:
+        """在 Top-3 中以 *判题等价超时* 复选, 并返回调高了 time_limit 的运行代码.
+
+        返回 dict 含键 ``code`` (可直接写入 generated_submit_solution.py) 与
+        ``config`` (为调高后的 final config).
+        """
+        if self.best is None and not self.history:
+            return None
+        candidates = sorted(self.history, key=lambda r: r["rank"])[:self.finalize_top_k]
+        if not candidates:
+            candidates = [self.best] if self.best else []
+        # 如果搜索期使用了与判题不同的超时, 需要在判题等价超时下复选.
+        results: List[Dict[str, Any]] = []
+        need_recheck = abs(self.search_per_case_timeout - self.per_case_timeout) > 1e-6
+        # 钳制 final time_limit: 必须给子进程留余量, 否则求解器内部 deadline 还没到
+        # 就被外部 kill, 直接拿不到结果.
+        safe_final_limit = min(self.final_solver_time_limit, self.per_case_timeout - 0.3)
+        if safe_final_limit < self.final_solver_time_limit - 1e-6:
+            self.log(
+                f"clamped final time_limit {self.final_solver_time_limit:.2f}s -> "
+                f"{safe_final_limit:.2f}s (per_case_timeout={self.per_case_timeout:.2f}s)"
+            )
+        for cand in candidates:
+            cfg = copy.deepcopy(cand["config"])
+            if cfg.get("reference"):
+                continue
+            cfg["time_limit"] = safe_final_limit
+            code = render_solver(cfg)
+            strategy = {"name": cand["name"] + "_final", "config": cfg, "code": code}
+            margin = self.per_case_timeout * len(self.cases) + 0.5
+            if need_recheck and not self.out_of_total_time(margin=margin):
+                self.log(f"finalize recheck: {strategy['name']} at {self.per_case_timeout:.1f}s")
+                res = self.evaluate_strategy(strategy, timeout=self.per_case_timeout, track=False)
+                results.append({"strategy": strategy, "result": res, "rechecked": True})
+            else:
+                # 复选预算不足: 退化为搜索期 rank, 但仍写出调高 time_limit 的代码.
+                results.append({"strategy": strategy, "result": cand, "rechecked": False})
+        if not results:
+            return None
+        # finalize 比较忽略 runtime, 仅比 (failures, -covered, penalty); 长 runtime
+        # 在搜索期是劣势, 但在落盘后由判题机统一给到固定时限, 不应再作为 tiebreaker.
+        def finalize_key(item: Dict[str, Any]) -> Tuple[int, int, float]:
+            r = item["result"]["rank"]
+            return (r[0], r[1], r[2])
+
+        results.sort(key=finalize_key)
+        chosen = results[0]
+        chosen_result = chosen["result"]
+        chosen_result_copy = dict(chosen_result)
+        chosen_result_copy["name"] = chosen["strategy"]["name"]
+        chosen_result_copy["config"] = copy.deepcopy(chosen["strategy"]["config"])
+        chosen_result_copy["code"] = chosen["strategy"]["code"]
+        self.history.append(chosen_result_copy)
+        # finalize 的 chosen 一定是要写出去的求解器, 直接覆盖 best 以保证报告与落盘一致.
+        self.best = chosen_result_copy
+        self.log(
+            f"finalize: chose {chosen_result_copy['name']} "
+            f"covered={chosen_result_copy['total_covered']}/{chosen_result_copy['total_tasks']} "
+            f"penalty={chosen_result_copy['total_penalty']:.2f} "
+            f"(rechecked={chosen['rechecked']})"
+        )
+        return chosen["strategy"]
 
 
 # ===========================================================================
@@ -529,7 +628,7 @@ def build_tools(ctx: AgentContext) -> Tuple[List[StructuredTool], Dict[str, Stru
         strategy = make_strategy(
             name=name,
             seed=seed,
-            per_case_timeout=ctx.per_case_timeout,
+            per_case_timeout=ctx.search_per_case_timeout,
             profile_names=valid_profiles,
             use_flow=use_flow,
             use_beam=use_beam,
@@ -552,7 +651,7 @@ def build_tools(ctx: AgentContext) -> Tuple[List[StructuredTool], Dict[str, Stru
             return json.dumps({"ok": False, "error": "尚无 best 可变异"})
         cfg = copy.deepcopy(ctx.best["config"])
         if cfg.get("reference"):
-            cfg = base_config(ctx.seed, ctx.per_case_timeout)
+            cfg = base_config(ctx.seed, ctx.search_per_case_timeout)
             cfg["profiles"] = [copy.deepcopy(PROFILE_LIBRARY["expected"]),
                                copy.deepcopy(PROFILE_LIBRARY["coverage"])]
         rng = ctx.rng
@@ -594,7 +693,7 @@ def build_tools(ctx: AgentContext) -> Tuple[List[StructuredTool], Dict[str, Stru
         if not ctx.pending:
             return json.dumps({"ok": False, "error": "队列为空"})
         results = []
-        while ctx.pending and not ctx.out_of_time(margin=ctx.per_case_timeout * len(ctx.cases) + 0.5):
+        while ctx.pending and not ctx.out_of_time(margin=ctx.search_per_case_timeout * len(ctx.cases) + 0.5):
             strategy = ctx.pending.pop(0)
             ctx.iteration += 1
             res = ctx.evaluate_strategy(strategy)
@@ -715,7 +814,7 @@ def make_analyze_node(ctx: AgentContext):
             strategy = make_strategy(
                 name=recipe["name"],
                 seed=ctx.seed,
-                per_case_timeout=ctx.per_case_timeout,
+                per_case_timeout=ctx.search_per_case_timeout,
                 profile_names=recipe["profiles"],
                 use_flow=recipe.get("use_flow", False),
                 use_beam=recipe.get("use_beam", False),
@@ -729,19 +828,23 @@ def make_analyze_node(ctx: AgentContext):
 
 def make_finalize_node(ctx: AgentContext, output_path: str):
     def node(state: AgentState) -> AgentState:
-        if ctx.best is None:
-            ctx.log("no best yet -> falling back to expected_greedy")
+        if ctx.best is None and not ctx.history:
+            ctx.log("no candidate yet -> falling back to expected_greedy")
             fallback = make_strategy(
-                "expected_greedy_fallback", ctx.seed, ctx.per_case_timeout,
+                "expected_greedy_fallback", ctx.seed, ctx.search_per_case_timeout,
                 ["expected", "coverage", "willingness"],
             )
-            ctx.evaluate_strategy(fallback)
-        if ctx.best is None:
+            ctx.evaluate_strategy(fallback, timeout=ctx.search_per_case_timeout, track=True)
+        chosen = ctx.finalize_best()
+        if chosen is None:
             raise RuntimeError("Agent failed to produce any valid solution")
         path = output_path if os.path.isabs(output_path) else os.path.abspath(output_path)
         with open(path, "w") as handle:
-            handle.write(ctx.best["code"])
-        ctx.log(f"wrote solver to {path}")
+            handle.write(chosen["code"])
+        ctx.log(
+            f"wrote solver to {path} "
+            f"(time_limit={chosen['config'].get('time_limit')})"
+        )
         return {"phase": "done", "finalized": True}
 
     return node
@@ -756,7 +859,7 @@ def heuristic_loop_node(ctx: AgentContext) -> Callable[[AgentState], AgentState]
         rng = ctx.rng
         # 第一步: 跑光初始候选.
         if ctx.pending:
-            while ctx.pending and not ctx.out_of_time(margin=ctx.per_case_timeout * len(ctx.cases) + 0.5):
+            while ctx.pending and not ctx.out_of_time(margin=ctx.search_per_case_timeout * len(ctx.cases) + 0.5):
                 ctx.iteration += 1
                 ctx.evaluate_strategy(ctx.pending.pop(0))
 
@@ -765,7 +868,7 @@ def heuristic_loop_node(ctx: AgentContext) -> Callable[[AgentState], AgentState]
         cycle_index = 0
         no_improve_streak = 0
         last_best_rank = ctx.best["rank"] if ctx.best else None
-        while not ctx.out_of_time(margin=ctx.per_case_timeout * len(ctx.cases) + 0.5):
+        while not ctx.out_of_time(margin=ctx.search_per_case_timeout * len(ctx.cases) + 0.5):
             focus = focus_cycle[cycle_index % len(focus_cycle)]
             cycle_index += 1
             mutated = _mutate_from_history(ctx, focus, rng)
@@ -801,7 +904,7 @@ def _mutate_from_history(ctx: AgentContext, focus: str, rng: random.Random) -> O
     parent = rng.choice(candidates)
     cfg = copy.deepcopy(parent["config"])
     if cfg.get("reference"):
-        cfg = base_config(ctx.seed, ctx.per_case_timeout)
+        cfg = base_config(ctx.seed, ctx.search_per_case_timeout)
         cfg["profiles"] = [copy.deepcopy(PROFILE_LIBRARY["expected"]),
                            copy.deepcopy(PROFILE_LIBRARY["coverage"])]
     if focus == "coverage":
@@ -930,11 +1033,11 @@ def llm_loop_node(ctx: AgentContext, llm: "ChatOpenAI", tool_objs: List[Structur
             if finalized:
                 break
         # 残余: 如果 LLM 终止前还有 pending 未跑完, 自己跑掉.
-        while ctx.pending and not ctx.out_of_time(margin=ctx.per_case_timeout * len(ctx.cases) + 0.5):
+        while ctx.pending and not ctx.out_of_time(margin=ctx.search_per_case_timeout * len(ctx.cases) + 0.5):
             ctx.iteration += 1
             ctx.evaluate_strategy(ctx.pending.pop(0))
         # 仍有时间就退化到启发式继续榨取.
-        if not ctx.out_of_time(margin=ctx.per_case_timeout * len(ctx.cases) + 0.5):
+        if not ctx.out_of_time(margin=ctx.search_per_case_timeout * len(ctx.cases) + 0.5):
             heuristic_loop_node(ctx)({})
         return {"phase": "finalize", "iteration": ctx.iteration, "last_action": "llm_loop"}
 
@@ -999,12 +1102,16 @@ class AutoSolverLangChainAgent:
         max_cases: int = 3,
         use_llm: Optional[bool] = None,
         verbose: bool = True,
+        search_per_case_timeout: Optional[float] = None,
+        final_solver_time_limit: float = 8.75,
     ) -> None:
         self.case_paths = case_paths or []
         self.output_path = output_path
         self.reference_solver_path = reference_solver_path
         self.budget_seconds = budget_seconds
         self.per_case_timeout = per_case_timeout
+        self.search_per_case_timeout = search_per_case_timeout or per_case_timeout
+        self.final_solver_time_limit = final_solver_time_limit
         self.seed = seed
         self.max_cases = max_cases
         self.use_llm = use_llm if use_llm is not None else True
@@ -1070,6 +1177,8 @@ class AutoSolverLangChainAgent:
             cases=cases,
             seed=self.seed,
             per_case_timeout=self.per_case_timeout,
+            search_per_case_timeout=self.search_per_case_timeout,
+            final_solver_time_limit=self.final_solver_time_limit,
             deadline=deadline,
             rng=rng,
             verbose=self.verbose,
@@ -1125,7 +1234,9 @@ def main() -> None:
     parser.add_argument("--out", default="generated_submit_solution.py", help="生成的求解器文件路径")
     parser.add_argument("--reference", default="submit_solution.py", help="参考求解器文件 (用于基线对比)")
     parser.add_argument("--budget", type=float, default=90.0, help="Agent 总时间预算 (秒)")
-    parser.add_argument("--per-case-timeout", type=float, default=10.0, help="单个 case 评估超时 (秒)")
+    parser.add_argument("--per-case-timeout", type=float, default=10.0, help="判题机等价超时 (秒), 用于 final 复选")
+    parser.add_argument("--search-per-case-timeout", type=float, default=None, help="搜索期超时 (秒), 默认=per-case-timeout; 调小以多迭代")
+    parser.add_argument("--final-time-limit", type=float, default=8.75, help="最终求解器内部 time_limit (秒)")
     parser.add_argument("--seed", type=int, default=20260524)
     parser.add_argument("--max-cases", type=int, default=3)
     parser.add_argument("--no-llm", action="store_true", help="强制使用启发式控制器")
@@ -1138,6 +1249,8 @@ def main() -> None:
         reference_solver_path=args.reference,
         budget_seconds=args.budget,
         per_case_timeout=args.per_case_timeout,
+        search_per_case_timeout=args.search_per_case_timeout,
+        final_solver_time_limit=args.final_time_limit,
         seed=args.seed,
         max_cases=args.max_cases,
         use_llm=not args.no_llm,

@@ -1,16 +1,14 @@
 
 from collections import defaultdict
-import math
 import random
 import time
 
-CONFIG = {'time_limit': 8.75, 'seed': 20260524, 'local_rounds': 3, 'loop_local_rounds': 1, 'extra_limit': 80, 'max_local_keys': 80, 'mutate_coverage': 15.0, 'mutate_pair': 20.0, 'mutate_willingness': 12.0, 'loop_random_weight': 8.0, 'beam_width': 160, 'beam_keep_per_group': 4, 'beam_task_limit': 42, 'use_flow': False, 'use_beam': False, 'use_sa': False, 'sa_temp': 30.0, 'sa_cooling': 0.93, 'sa_iters_per_temp': 30, 'sa_min_temp': 0.5, 'profiles': [{'coverage_weight': 30.0, 'pair_weight': 0.0, 'willingness_weight': 5.0, 'score_weight': 0.0, 'random_weight': 0.0}, {'coverage_weight': 0.0, 'pair_weight': 0.0, 'willingness_weight': 0.0, 'score_weight': 0.0, 'random_weight': 0.0}, {'coverage_weight': 12.0, 'pair_weight': 45.0, 'willingness_weight': 5.0, 'score_weight': 0.0, 'random_weight': 0.0}]}
+CONFIG = {'time_limit': 8.75, 'seed': 20260524, 'local_rounds': 3, 'loop_local_rounds': 1, 'extra_limit': 80, 'max_local_keys': 80, 'mutate_coverage': 15.0, 'mutate_pair': 20.0, 'mutate_willingness': 12.0, 'loop_random_weight': 8.0, 'beam_width': 150, 'beam_keep_per_group': 4, 'beam_task_limit': 42, 'use_flow': False, 'use_beam': False, 'profiles': [{'coverage_weight': 0.0, 'pair_weight': 0.0, 'willingness_weight': 0.0, 'score_weight': 0.0, 'random_weight': 0.0}, {'coverage_weight': 30.0, 'pair_weight': 0.0, 'willingness_weight': 5.0, 'score_weight': 0.0, 'random_weight': 0.0}, {'coverage_weight': 6.0, 'pair_weight': 8.0, 'willingness_weight': 35.0, 'score_weight': 0.0, 'random_weight': 0.0}]}
 
 
 def solve(input_text: str) -> list:
     start_time = time.time()
     deadline = start_time + CONFIG.get("time_limit", 8.75)
-
     rows = []
     by_key = defaultdict(dict)
     key_tasks = {}
@@ -74,8 +72,7 @@ def solve(input_text: str) -> list:
         return len(seen)
 
     def total_penalty(groups):
-        miss = len(all_tasks) - covered_count(groups)
-        return sum(penalty(k, v) for k, v in groups.items()) + 100.0 * miss
+        return sum(penalty(task_key, couriers) for task_key, couriers in groups.items())
 
     def valid_groups(groups):
         used_tasks = set()
@@ -124,6 +121,18 @@ def solve(input_text: str) -> list:
                 used_tasks.update(key_tasks[task_key])
                 used_couriers.update(clean)
         return result
+
+    def consider(groups):
+        nonlocal_best[0] = nonlocal_best[0]
+        if not groups:
+            return
+        groups = normalize(groups)
+        if not groups or not valid_groups(groups):
+            return
+        rank = (-covered_count(groups), total_penalty(groups))
+        if nonlocal_best[1] is None or rank < nonlocal_best[1]:
+            nonlocal_best[0] = clone_groups(groups)
+            nonlocal_best[1] = rank
 
     def cover_unassigned(groups):
         groups = clone_groups(groups)
@@ -267,65 +276,6 @@ def solve(input_text: str) -> list:
                 groups[a] = next_a
                 groups[b] = next_b
         return groups
-
-    def simulated_annealing(groups, rng):
-        if not CONFIG.get("use_sa", False):
-            return groups
-        groups = clone_groups(groups)
-        best_groups = clone_groups(groups)
-        cur_cost = total_penalty(groups)
-        best_cost = cur_cost
-        temp = CONFIG.get("sa_temp", 30.0)
-        cooling = CONFIG.get("sa_cooling", 0.93)
-        iters_per_temp = CONFIG.get("sa_iters_per_temp", 30)
-        min_temp = CONFIG.get("sa_min_temp", 0.5)
-        while temp > min_temp and time.time() < deadline - 0.04:
-            for _ in range(iters_per_temp):
-                if time.time() >= deadline - 0.04:
-                    break
-                keys = list(groups)
-                if not keys:
-                    break
-                op = rng.random()
-                trial = clone_groups(groups)
-                if op < 0.5 and len(keys) >= 2:
-                    a, b = rng.sample(keys, 2)
-                    if not trial[a] or not trial[b]:
-                        continue
-                    ca = rng.choice(trial[a])
-                    cb = rng.choice(trial[b])
-                    if ca not in by_key[b] or cb not in by_key[a]:
-                        continue
-                    trial[a] = [c for c in trial[a] if c != ca] + [cb]
-                    trial[b] = [c for c in trial[b] if c != cb] + [ca]
-                elif op < 0.8:
-                    a = rng.choice(keys)
-                    candidates = [c for c in by_key[a] if c not in trial[a]]
-                    used = set(c for couriers in trial.values() for c in couriers)
-                    candidates = [c for c in candidates if c not in used]
-                    if not candidates or not trial[a]:
-                        continue
-                    new_c = rng.choice(candidates)
-                    old_c = rng.choice(trial[a])
-                    trial[a] = [c for c in trial[a] if c != old_c] + [new_c]
-                else:
-                    a = rng.choice(keys)
-                    if len(trial[a]) <= 1:
-                        continue
-                    drop = rng.choice(trial[a])
-                    trial[a] = [c for c in trial[a] if c != drop]
-                if not valid_groups(trial):
-                    continue
-                new_cost = total_penalty(trial)
-                delta = new_cost - cur_cost
-                if delta < 0 or rng.random() < math.exp(-delta / max(1e-6, temp)):
-                    groups = trial
-                    cur_cost = new_cost
-                    if new_cost < best_cost:
-                        best_cost = new_cost
-                        best_groups = clone_groups(trial)
-            temp *= cooling
-        return best_groups
 
     def single_flow_initial():
         if not CONFIG.get("use_flow", False):
@@ -500,17 +450,6 @@ def solve(input_text: str) -> list:
     nonlocal_best = [None, None]
     profiles = CONFIG.get("profiles", [])
 
-    def consider(groups):
-        if not groups:
-            return
-        groups = normalize(groups)
-        if not groups or not valid_groups(groups):
-            return
-        rank = (-covered_count(groups), total_penalty(groups))
-        if nonlocal_best[1] is None or rank < nonlocal_best[1]:
-            nonlocal_best[0] = clone_groups(groups)
-            nonlocal_best[1] = rank
-
     for groups in (single_flow_initial(), beam_initial()):
         if time.time() >= deadline - 0.03:
             break
@@ -526,10 +465,6 @@ def solve(input_text: str) -> list:
         groups = fill_extra_couriers(groups)
         groups = local_improve(groups, CONFIG.get("local_rounds", 3))
         consider(groups)
-
-    if CONFIG.get("use_sa", False) and nonlocal_best[0] is not None:
-        sa_groups = simulated_annealing(clone_groups(nonlocal_best[0]), rng)
-        consider(sa_groups)
 
     round_no = 0
     while time.time() < deadline - 0.03:

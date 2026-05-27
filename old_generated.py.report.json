@@ -1,0 +1,46 @@
+{
+  "best": {
+    "cases": [
+      {
+        "case": "large_seed301.txt",
+        "covered": 40,
+        "error": null,
+        "penalty": 666.9933700741925,
+        "runtime": 8.734133005142212,
+        "status": "ok",
+        "tasks": 40
+      }
+    ],
+    "failures": 0,
+    "name": "expected_greedy",
+    "rank": [
+      0,
+      -40,
+      666.9933700741925,
+      8.734133005142212
+    ],
+    "total_covered": 40,
+    "total_penalty": 666.9933700741925,
+    "total_runtime": 8.734133005142212,
+    "total_tasks": 40
+  },
+  "cases": [
+    "large_seed301.txt"
+  ],
+  "evaluated_candidates": 10,
+  "output_path": "/home/aigix49/Project/old_generated.py",
+  "reference": {
+    "failures": 0,
+    "name": "reference",
+    "rank": [
+      0,
+      -40,
+      662.0080330959202,
+      8.824730157852173
+    ],
+    "total_covered": 40,
+    "total_penalty": 662.0080330959202,
+    "total_runtime": 8.824730157852173,
+    "total_tasks": 40
+  }
+}

@@ -4,7 +4,7 @@ import math
 import random
 import time
 
-CONFIG = {'time_limit': 8.75, 'seed': 20260524, 'local_rounds': 3, 'loop_local_rounds': 1, 'extra_limit': 80, 'max_local_keys': 80, 'mutate_coverage': 15.0, 'mutate_pair': 20.0, 'mutate_willingness': 12.0, 'loop_random_weight': 8.0, 'beam_width': 160, 'beam_keep_per_group': 4, 'beam_task_limit': 42, 'use_flow': False, 'use_beam': False, 'use_sa': False, 'sa_temp': 30.0, 'sa_cooling': 0.93, 'sa_iters_per_temp': 30, 'sa_min_temp': 0.5, 'profiles': [{'coverage_weight': 30.0, 'pair_weight': 0.0, 'willingness_weight': 5.0, 'score_weight': 0.0, 'random_weight': 0.0}, {'coverage_weight': 0.0, 'pair_weight': 0.0, 'willingness_weight': 0.0, 'score_weight': 0.0, 'random_weight': 0.0}, {'coverage_weight': 12.0, 'pair_weight': 45.0, 'willingness_weight': 5.0, 'score_weight': 0.0, 'random_weight': 0.0}]}
+CONFIG = {'time_limit': 2.75, 'seed': 20260524, 'local_rounds': 3, 'loop_local_rounds': 1, 'extra_limit': 80, 'max_local_keys': 80, 'mutate_coverage': 15.0, 'mutate_pair': 20.0, 'mutate_willingness': 12.0, 'loop_random_weight': 8.0, 'beam_width': 160, 'beam_keep_per_group': 4, 'beam_task_limit': 42, 'use_flow': True, 'use_beam': False, 'use_sa': False, 'sa_temp': 30.0, 'sa_cooling': 0.93, 'sa_iters_per_temp': 30, 'sa_min_temp': 0.5, 'profiles': [{'coverage_weight': 0.0, 'pair_weight': 0.0, 'willingness_weight': 0.0, 'score_weight': 0.0, 'random_weight': 0.0}, {'coverage_weight': 6.0, 'pair_weight': 8.0, 'willingness_weight': 35.0, 'score_weight': 0.0, 'random_weight': 0.0}, {'coverage_weight': 0.0, 'pair_weight': 0.0, 'willingness_weight': 0.0, 'score_weight': 0.15, 'random_weight': 0.0}]}
 
 
 def solve(input_text: str) -> list:
