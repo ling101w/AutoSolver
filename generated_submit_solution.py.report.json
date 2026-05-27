@@ -6,22 +6,22 @@
         "covered": 40,
         "error": null,
         "penalty": 669.6707483020567,
-        "runtime": 8.768373012542725,
+        "runtime": 8.733404874801636,
         "status": "ok",
         "tasks": 40
       }
     ],
     "failures": 0,
-    "name": "mut_balanced_009_final",
+    "name": "safe_cover_final",
     "rank": [
       0,
       -40,
       669.6707483020567,
-      8.768373012542725
+      8.733404874801636
     ],
     "total_covered": 40,
     "total_penalty": 669.6707,
-    "total_runtime": 8.768,
+    "total_runtime": 8.733,
     "total_tasks": 40
   },
   "cases": [
@@ -38,7 +38,7 @@
         "covered": 40,
         "error": null,
         "penalty": 662.0080330959202,
-        "runtime": 8.838383197784424,
+        "runtime": 8.78096628189087,
         "status": "ok",
         "tasks": 40
       }
@@ -49,11 +49,11 @@
       0,
       -40,
       662.0080330959202,
-      8.838383197784424
+      8.78096628189087
     ],
     "total_covered": 40,
     "total_penalty": 662.008,
-    "total_runtime": 8.838,
+    "total_runtime": 8.781,
     "total_tasks": 40
   }
 }

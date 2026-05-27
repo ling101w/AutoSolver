@@ -4,7 +4,7 @@ import math
 import random
 import time
 
-CONFIG = {'time_limit': 8.75, 'seed': 20276701, 'local_rounds': 3, 'loop_local_rounds': 1, 'extra_limit': 80, 'max_local_keys': 80, 'mutate_coverage': 15.0, 'mutate_pair': 20.0, 'mutate_willingness': 12.0, 'loop_random_weight': 8.0, 'beam_width': 160, 'beam_keep_per_group': 4, 'beam_task_limit': 42, 'use_flow': True, 'use_beam': True, 'use_sa': False, 'sa_temp': 30.0, 'sa_cooling': 0.93, 'sa_iters_per_temp': 30, 'sa_min_temp': 0.5, 'profiles': [{'coverage_weight': 45.0, 'pair_weight': 31.238234429567836, 'willingness_weight': 12.761499614591752, 'score_weight': 0.028464696520621134, 'random_weight': 0.0}, {'coverage_weight': 30.0, 'pair_weight': 0.0, 'willingness_weight': 4.441526119346925, 'score_weight': 0.0, 'random_weight': 0.0}, {'coverage_weight': 6.0, 'pair_weight': 13.962465717108834, 'willingness_weight': 30.250895909223686, 'score_weight': 0.0, 'random_weight': 0.0}]}
+CONFIG = {'time_limit': 8.75, 'seed': 20260524, 'local_rounds': 3, 'loop_local_rounds': 1, 'extra_limit': 80, 'max_local_keys': 80, 'mutate_coverage': 15.0, 'mutate_pair': 20.0, 'mutate_willingness': 12.0, 'loop_random_weight': 8.0, 'beam_width': 160, 'beam_keep_per_group': 4, 'beam_task_limit': 42, 'use_flow': True, 'use_beam': True, 'use_sa': False, 'sa_temp': 30.0, 'sa_cooling': 0.93, 'sa_iters_per_temp': 30, 'sa_min_temp': 0.5, 'profiles': [{'coverage_weight': 45.0, 'pair_weight': 20.0, 'willingness_weight': 15.0, 'score_weight': 0.0, 'random_weight': 0.0}, {'coverage_weight': 30.0, 'pair_weight': 0.0, 'willingness_weight': 5.0, 'score_weight': 0.0, 'random_weight': 0.0}, {'coverage_weight': 6.0, 'pair_weight': 8.0, 'willingness_weight': 35.0, 'score_weight': 0.0, 'random_weight': 0.0}]}
 
 
 def solve(input_text: str) -> list:
@@ -564,30 +564,26 @@ def solve(input_text: str) -> list:
 
     round_no = 0
     no_improve = 0
-    last_best_rank = nonlocal_best[1]
     while time.time() < deadline - 0.03:
         round_no += 1
-        operator = round_no % 4
         groups = None
-        if nonlocal_best[0] is not None and operator == 0:
-            # destroy-repair: drop 1~3 random groups, recover via cover_unassigned.
+        # 80% weighted_greedy 重启 (主探索), 10% destroy-repair, 10% kick.
+        roll = rng.random()
+        if nonlocal_best[0] is not None and roll < 0.10:
             base = clone_groups(nonlocal_best[0])
-            groups = destroy_repair(base, rng, 1 + round_no % 3)
-        elif nonlocal_best[0] is not None and operator == 1:
-            # kick: swap couriers between two groups, then local search.
+            groups = destroy_repair(base, rng, 1 + (round_no % 3))
+        elif nonlocal_best[0] is not None and roll < 0.20:
             base = clone_groups(nonlocal_best[0])
             kicked = kick_groups(base, rng, 1 + (no_improve % 3))
             groups = kicked if kicked else None
-        elif nonlocal_best[0] is not None and operator == 2 and no_improve >= 3:
-            # diversify: SA from current best when stuck.
+        elif nonlocal_best[0] is not None and no_improve >= 6 and CONFIG.get("use_sa", False):
+            # \u9577\u671f\u4e0d\u63d0\u5347 + \u5141\u8bb8 SA \u65f6, \u7528 SA \u6270\u52a8 best.
             base = clone_groups(nonlocal_best[0])
-            sa_groups = simulated_annealing(base, rng) if CONFIG.get("use_sa", False) else None
-            if sa_groups is None or not valid_groups(sa_groups):
-                groups = destroy_repair(base, rng, 2 + round_no % 4)
-            else:
-                groups = sa_groups
+            sa_groups = simulated_annealing(base, rng)
+            groups = sa_groups if sa_groups and valid_groups(sa_groups) else None
+            if groups:
+                no_improve = 0
         else:
-            # restart via weighted greedy mutation.
             base = profiles[round_no % len(profiles)] if profiles else {}
             profile = dict(base)
             profile["coverage_weight"] = profile.get("coverage_weight", 0.0) + rng.random() * CONFIG.get("mutate_coverage", 15.0)
@@ -606,7 +602,6 @@ def solve(input_text: str) -> list:
             no_improve += 1
         else:
             no_improve = 0
-            last_best_rank = nonlocal_best[1]
 
     if nonlocal_best[0] is None:
         return []

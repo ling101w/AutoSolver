@@ -578,23 +578,22 @@ def solve(input_text: str) -> list:
     while time.time() < deadline - 0.03:
         round_no += 1
         groups = None
-        # 80% weighted_greedy 重启 (主探索), 10% destroy-repair, 10% kick.
-        roll = rng.random()
-        if nonlocal_best[0] is not None and roll < 0.10:
+        if nonlocal_best[0] is not None and round_no % 5 == 0:
+            # \u4fdd\u7559\u65e7\u7248\u7b56\u7565: \u6bcf 5 \u8f6e\u7528 destroy_repair \u6270\u52a8 best.
             base = clone_groups(nonlocal_best[0])
-            groups = destroy_repair(base, rng, 1 + (round_no % 3))
-        elif nonlocal_best[0] is not None and roll < 0.20:
+            groups = destroy_repair(base, rng, 1 + round_no % 3)
+        elif nonlocal_best[0] is not None and no_improve >= 4 and round_no % 3 == 0:
+            # \u957f\u671f\u4e0d\u63d0\u5347\u65f6\u8bd5\u8bd5 kick (\u4ec5\u4f5c\u4e3a\u5907\u7528\u7406\u9519\u51fa\u53e3).
             base = clone_groups(nonlocal_best[0])
-            kicked = kick_groups(base, rng, 1 + (no_improve % 3))
+            kicked = kick_groups(base, rng, 1 + (no_improve // 4))
             groups = kicked if kicked else None
-        elif nonlocal_best[0] is not None and no_improve >= 6 and CONFIG.get("use_sa", False):
-            # \u9577\u671f\u4e0d\u63d0\u5347 + \u5141\u8bb8 SA \u65f6, \u7528 SA \u6270\u52a8 best.
+        elif nonlocal_best[0] is not None and no_improve >= 8 and CONFIG.get("use_sa", False):
             base = clone_groups(nonlocal_best[0])
             sa_groups = simulated_annealing(base, rng)
-            groups = sa_groups if sa_groups and valid_groups(sa_groups) else None
-            if groups:
+            if sa_groups and valid_groups(sa_groups):
+                groups = sa_groups
                 no_improve = 0
-        else:
+        if groups is None:
             base = profiles[round_no % len(profiles)] if profiles else {}
             profile = dict(base)
             profile["coverage_weight"] = profile.get("coverage_weight", 0.0) + rng.random() * CONFIG.get("mutate_coverage", 15.0)
