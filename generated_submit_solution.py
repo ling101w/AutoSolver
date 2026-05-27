@@ -4,7 +4,7 @@ import math
 import random
 import time
 
-CONFIG = {'time_limit': 8.75, 'seed': 20260524, 'local_rounds': 3, 'loop_local_rounds': 1, 'extra_limit': 80, 'max_local_keys': 80, 'mutate_coverage': 15.0, 'mutate_pair': 20.0, 'mutate_willingness': 12.0, 'loop_random_weight': 8.0, 'beam_width': 160, 'beam_keep_per_group': 4, 'beam_task_limit': 42, 'use_flow': False, 'use_beam': False, 'use_sa': False, 'sa_temp': 30.0, 'sa_cooling': 0.93, 'sa_iters_per_temp': 30, 'sa_min_temp': 0.5, 'profiles': [{'coverage_weight': 30.0, 'pair_weight': 0.0, 'willingness_weight': 5.0, 'score_weight': 0.0, 'random_weight': 0.0}, {'coverage_weight': 0.0, 'pair_weight': 0.0, 'willingness_weight': 0.0, 'score_weight': 0.0, 'random_weight': 0.0}, {'coverage_weight': 12.0, 'pair_weight': 45.0, 'willingness_weight': 5.0, 'score_weight': 0.0, 'random_weight': 0.0}]}
+CONFIG = {'time_limit': 8.75, 'seed': 20276701, 'local_rounds': 3, 'loop_local_rounds': 1, 'extra_limit': 80, 'max_local_keys': 80, 'mutate_coverage': 15.0, 'mutate_pair': 20.0, 'mutate_willingness': 12.0, 'loop_random_weight': 8.0, 'beam_width': 160, 'beam_keep_per_group': 4, 'beam_task_limit': 42, 'use_flow': True, 'use_beam': True, 'use_sa': False, 'sa_temp': 30.0, 'sa_cooling': 0.93, 'sa_iters_per_temp': 30, 'sa_min_temp': 0.5, 'profiles': [{'coverage_weight': 45.0, 'pair_weight': 31.238234429567836, 'willingness_weight': 12.761499614591752, 'score_weight': 0.028464696520621134, 'random_weight': 0.0}, {'coverage_weight': 30.0, 'pair_weight': 0.0, 'willingness_weight': 4.441526119346925, 'score_weight': 0.0, 'random_weight': 0.0}, {'coverage_weight': 6.0, 'pair_weight': 13.962465717108834, 'willingness_weight': 30.250895909223686, 'score_weight': 0.0, 'random_weight': 0.0}]}
 
 
 def solve(input_text: str) -> list:
@@ -266,6 +266,37 @@ def solve(input_text: str) -> list:
                 _, a, b, next_a, next_b = op
                 groups[a] = next_a
                 groups[b] = next_b
+        return groups
+
+    def destroy_repair(groups, rng, drop_count):
+        groups = clone_groups(groups)
+        if not groups:
+            return groups
+        keys = list(groups)
+        rng.shuffle(keys)
+        drop = min(max(1, drop_count), len(keys))
+        for key in keys[:drop]:
+            del groups[key]
+        recovered = cover_unassigned(groups)
+        return recovered if valid_groups(recovered) else groups
+
+    def kick_groups(groups, rng, strength):
+        groups = clone_groups(groups)
+        keys = list(groups)
+        if len(keys) < 2:
+            return groups
+        for _ in range(max(1, strength)):
+            a, b = rng.sample(keys, 2)
+            if not groups.get(a) or not groups.get(b):
+                continue
+            ca = rng.choice(groups[a])
+            cb = rng.choice(groups[b])
+            if cb not in by_key.get(a, {}) or ca not in by_key.get(b, {}):
+                continue
+            groups[a] = [c for c in groups[a] if c != ca] + [cb]
+            groups[b] = [c for c in groups[b] if c != cb] + [ca]
+        if not valid_groups(groups):
+            return None
         return groups
 
     def simulated_annealing(groups, rng):
@@ -532,17 +563,31 @@ def solve(input_text: str) -> list:
         consider(sa_groups)
 
     round_no = 0
+    no_improve = 0
+    last_best_rank = nonlocal_best[1]
     while time.time() < deadline - 0.03:
         round_no += 1
-        if nonlocal_best[0] is not None and round_no % 5 == 0:
-            groups = clone_groups(nonlocal_best[0])
-            keys = list(groups)
-            rng.shuffle(keys)
-            for key in keys[:1 + round_no % 3]:
-                if key in groups:
-                    del groups[key]
-            groups = cover_unassigned(groups)
+        operator = round_no % 4
+        groups = None
+        if nonlocal_best[0] is not None and operator == 0:
+            # destroy-repair: drop 1~3 random groups, recover via cover_unassigned.
+            base = clone_groups(nonlocal_best[0])
+            groups = destroy_repair(base, rng, 1 + round_no % 3)
+        elif nonlocal_best[0] is not None and operator == 1:
+            # kick: swap couriers between two groups, then local search.
+            base = clone_groups(nonlocal_best[0])
+            kicked = kick_groups(base, rng, 1 + (no_improve % 3))
+            groups = kicked if kicked else None
+        elif nonlocal_best[0] is not None and operator == 2 and no_improve >= 3:
+            # diversify: SA from current best when stuck.
+            base = clone_groups(nonlocal_best[0])
+            sa_groups = simulated_annealing(base, rng) if CONFIG.get("use_sa", False) else None
+            if sa_groups is None or not valid_groups(sa_groups):
+                groups = destroy_repair(base, rng, 2 + round_no % 4)
+            else:
+                groups = sa_groups
         else:
+            # restart via weighted greedy mutation.
             base = profiles[round_no % len(profiles)] if profiles else {}
             profile = dict(base)
             profile["coverage_weight"] = profile.get("coverage_weight", 0.0) + rng.random() * CONFIG.get("mutate_coverage", 15.0)
@@ -551,10 +596,17 @@ def solve(input_text: str) -> list:
             profile["random_weight"] = max(profile.get("random_weight", 0.0), CONFIG.get("loop_random_weight", 8.0))
             groups = weighted_greedy(profile, rng)
         if not groups:
+            no_improve += 1
             continue
         groups = fill_extra_couriers(groups)
         groups = local_improve(groups, CONFIG.get("loop_local_rounds", 1))
+        prev_rank = nonlocal_best[1]
         consider(groups)
+        if nonlocal_best[1] == prev_rank:
+            no_improve += 1
+        else:
+            no_improve = 0
+            last_best_rank = nonlocal_best[1]
 
     if nonlocal_best[0] is None:
         return []

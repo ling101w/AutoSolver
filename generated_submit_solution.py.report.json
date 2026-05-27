@@ -5,23 +5,23 @@
         "case": "large_seed301.txt",
         "covered": 40,
         "error": null,
-        "penalty": 666.9933700741925,
-        "runtime": 8.76683497428894,
+        "penalty": 669.6707483020567,
+        "runtime": 8.768373012542725,
         "status": "ok",
         "tasks": 40
       }
     ],
     "failures": 0,
-    "name": "coverage_first_final",
+    "name": "mut_balanced_009_final",
     "rank": [
       0,
       -40,
-      666.9933700741925,
-      8.76683497428894
+      669.6707483020567,
+      8.768373012542725
     ],
     "total_covered": 40,
-    "total_penalty": 666.9934,
-    "total_runtime": 8.767,
+    "total_penalty": 669.6707,
+    "total_runtime": 8.768,
     "total_tasks": 40
   },
   "cases": [
@@ -38,7 +38,7 @@
         "covered": 40,
         "error": null,
         "penalty": 662.0080330959202,
-        "runtime": 8.843577146530151,
+        "runtime": 8.838383197784424,
         "status": "ok",
         "tasks": 40
       }
@@ -49,11 +49,11 @@
       0,
       -40,
       662.0080330959202,
-      8.843577146530151
+      8.838383197784424
     ],
     "total_covered": 40,
     "total_penalty": 662.008,
-    "total_runtime": 8.844,
+    "total_runtime": 8.838,
     "total_tasks": 40
   }
 }

@@ -279,6 +279,37 @@ def solve(input_text: str) -> list:
                 groups[b] = next_b
         return groups
 
+    def destroy_repair(groups, rng, drop_count):
+        groups = clone_groups(groups)
+        if not groups:
+            return groups
+        keys = list(groups)
+        rng.shuffle(keys)
+        drop = min(max(1, drop_count), len(keys))
+        for key in keys[:drop]:
+            del groups[key]
+        recovered = cover_unassigned(groups)
+        return recovered if valid_groups(recovered) else groups
+
+    def kick_groups(groups, rng, strength):
+        groups = clone_groups(groups)
+        keys = list(groups)
+        if len(keys) < 2:
+            return groups
+        for _ in range(max(1, strength)):
+            a, b = rng.sample(keys, 2)
+            if not groups.get(a) or not groups.get(b):
+                continue
+            ca = rng.choice(groups[a])
+            cb = rng.choice(groups[b])
+            if cb not in by_key.get(a, {}) or ca not in by_key.get(b, {}):
+                continue
+            groups[a] = [c for c in groups[a] if c != ca] + [cb]
+            groups[b] = [c for c in groups[b] if c != cb] + [ca]
+        if not valid_groups(groups):
+            return None
+        return groups
+
     def simulated_annealing(groups, rng):
         if not CONFIG.get("use_sa", False):
             return groups
@@ -543,16 +574,26 @@ def solve(input_text: str) -> list:
         consider(sa_groups)
 
     round_no = 0
+    no_improve = 0
     while time.time() < deadline - 0.03:
         round_no += 1
-        if nonlocal_best[0] is not None and round_no % 5 == 0:
-            groups = clone_groups(nonlocal_best[0])
-            keys = list(groups)
-            rng.shuffle(keys)
-            for key in keys[:1 + round_no % 3]:
-                if key in groups:
-                    del groups[key]
-            groups = cover_unassigned(groups)
+        groups = None
+        # 80% weighted_greedy 重启 (主探索), 10% destroy-repair, 10% kick.
+        roll = rng.random()
+        if nonlocal_best[0] is not None and roll < 0.10:
+            base = clone_groups(nonlocal_best[0])
+            groups = destroy_repair(base, rng, 1 + (round_no % 3))
+        elif nonlocal_best[0] is not None and roll < 0.20:
+            base = clone_groups(nonlocal_best[0])
+            kicked = kick_groups(base, rng, 1 + (no_improve % 3))
+            groups = kicked if kicked else None
+        elif nonlocal_best[0] is not None and no_improve >= 6 and CONFIG.get("use_sa", False):
+            # \u9577\u671f\u4e0d\u63d0\u5347 + \u5141\u8bb8 SA \u65f6, \u7528 SA \u6270\u52a8 best.
+            base = clone_groups(nonlocal_best[0])
+            sa_groups = simulated_annealing(base, rng)
+            groups = sa_groups if sa_groups and valid_groups(sa_groups) else None
+            if groups:
+                no_improve = 0
         else:
             base = profiles[round_no % len(profiles)] if profiles else {}
             profile = dict(base)
@@ -562,10 +603,16 @@ def solve(input_text: str) -> list:
             profile["random_weight"] = max(profile.get("random_weight", 0.0), CONFIG.get("loop_random_weight", 8.0))
             groups = weighted_greedy(profile, rng)
         if not groups:
+            no_improve += 1
             continue
         groups = fill_extra_couriers(groups)
         groups = local_improve(groups, CONFIG.get("loop_local_rounds", 1))
+        prev_rank = nonlocal_best[1]
         consider(groups)
+        if nonlocal_best[1] == prev_rank:
+            no_improve += 1
+        else:
+            no_improve = 0
 
     if nonlocal_best[0] is None:
         return []
