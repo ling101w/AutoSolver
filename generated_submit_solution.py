@@ -4,7 +4,7 @@ import math
 import random
 import time
 
-CONFIG = {'time_limit': 8.75, 'seed': 20260524, 'local_rounds': 3, 'loop_local_rounds': 1, 'extra_limit': 80, 'max_local_keys': 80, 'mutate_coverage': 15.0, 'mutate_pair': 20.0, 'mutate_willingness': 12.0, 'loop_random_weight': 8.0, 'beam_width': 160, 'beam_keep_per_group': 4, 'beam_task_limit': 42, 'use_flow': True, 'use_beam': True, 'use_sa': False, 'sa_temp': 30.0, 'sa_cooling': 0.93, 'sa_iters_per_temp': 30, 'sa_min_temp': 0.5, 'profiles': [{'coverage_weight': 45.0, 'pair_weight': 20.0, 'willingness_weight': 15.0, 'score_weight': 0.0, 'random_weight': 0.0}, {'coverage_weight': 30.0, 'pair_weight': 0.0, 'willingness_weight': 5.0, 'score_weight': 0.0, 'random_weight': 0.0}, {'coverage_weight': 6.0, 'pair_weight': 8.0, 'willingness_weight': 35.0, 'score_weight': 0.0, 'random_weight': 0.0}]}
+CONFIG = {'time_limit': 8.75, 'seed': 20283935, 'local_rounds': 4, 'loop_local_rounds': 1, 'extra_limit': 80, 'max_local_keys': 80, 'mutate_coverage': 15.0, 'mutate_pair': 20.0, 'mutate_willingness': 12.0, 'loop_random_weight': 8.0, 'beam_width': 160, 'beam_keep_per_group': 4, 'beam_task_limit': 42, 'use_flow': True, 'use_beam': False, 'use_sa': True, 'sa_temp': 25.24897374532431, 'sa_cooling': 0.93, 'sa_iters_per_temp': 30, 'sa_min_temp': 0.5, 'profiles': [{'coverage_weight': 0.0, 'pair_weight': 4.0545328188614995, 'willingness_weight': 0.0, 'score_weight': 0.015171772871458683, 'random_weight': 5.211020586975503}, {'coverage_weight': 6.0, 'pair_weight': 8.26848365024398, 'willingness_weight': 29.601408325403785, 'score_weight': 0.04639747836645514, 'random_weight': 4.656155639525737}, {'coverage_weight': 0.0, 'pair_weight': 0.0, 'willingness_weight': 0.0, 'score_weight': 0.1312533165792697, 'random_weight': 8.398034737224258}]}
 
 
 def solve(input_text: str) -> list:
@@ -567,23 +567,22 @@ def solve(input_text: str) -> list:
     while time.time() < deadline - 0.03:
         round_no += 1
         groups = None
-        # 80% weighted_greedy 重启 (主探索), 10% destroy-repair, 10% kick.
-        roll = rng.random()
-        if nonlocal_best[0] is not None and roll < 0.10:
+        if nonlocal_best[0] is not None and round_no % 5 == 0:
+            # \u4fdd\u7559\u65e7\u7248\u7b56\u7565: \u6bcf 5 \u8f6e\u7528 destroy_repair \u6270\u52a8 best.
             base = clone_groups(nonlocal_best[0])
-            groups = destroy_repair(base, rng, 1 + (round_no % 3))
-        elif nonlocal_best[0] is not None and roll < 0.20:
+            groups = destroy_repair(base, rng, 1 + round_no % 3)
+        elif nonlocal_best[0] is not None and no_improve >= 4 and round_no % 3 == 0:
+            # \u957f\u671f\u4e0d\u63d0\u5347\u65f6\u8bd5\u8bd5 kick (\u4ec5\u4f5c\u4e3a\u5907\u7528\u7406\u9519\u51fa\u53e3).
             base = clone_groups(nonlocal_best[0])
-            kicked = kick_groups(base, rng, 1 + (no_improve % 3))
+            kicked = kick_groups(base, rng, 1 + (no_improve // 4))
             groups = kicked if kicked else None
-        elif nonlocal_best[0] is not None and no_improve >= 6 and CONFIG.get("use_sa", False):
-            # \u9577\u671f\u4e0d\u63d0\u5347 + \u5141\u8bb8 SA \u65f6, \u7528 SA \u6270\u52a8 best.
+        elif nonlocal_best[0] is not None and no_improve >= 8 and CONFIG.get("use_sa", False):
             base = clone_groups(nonlocal_best[0])
             sa_groups = simulated_annealing(base, rng)
-            groups = sa_groups if sa_groups and valid_groups(sa_groups) else None
-            if groups:
+            if sa_groups and valid_groups(sa_groups):
+                groups = sa_groups
                 no_improve = 0
-        else:
+        if groups is None:
             base = profiles[round_no % len(profiles)] if profiles else {}
             profile = dict(base)
             profile["coverage_weight"] = profile.get("coverage_weight", 0.0) + rng.random() * CONFIG.get("mutate_coverage", 15.0)
