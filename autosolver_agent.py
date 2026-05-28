@@ -7,8 +7,11 @@ import json
 import multiprocessing
 import os
 import random
+import re
 import time
 import traceback
+import urllib.error
+import urllib.request
 
 
 SOLVER_TEMPLATE = r'''
@@ -892,6 +895,529 @@ class AutoSolverAgent(object):
                 "failures": self.reference_result["failures"],
             }
         return {"output_path": os.path.abspath(self.output_path), "cases": [case["name"] for case in self.cases], "best": best, "reference": reference, "evaluated_candidates": len(self.history)}
+
+
+class OpenAICompatibleChat(object):
+    """Minimal OpenAI-compatible chat-completions client used by the LLM agent."""
+
+    def __init__(self, model=None, base_url=None, api_key=None, timeout=60.0, max_tokens=None):
+        self.model = model or os.environ.get("AUTOSOLVER_LLM_MODEL", "gpt-4o-mini")
+        self.base_url = base_url or os.environ.get("OPENAI_BASE_URL") or os.environ.get("OPENAI_API_BASE") or "https://api.openai.com/v1"
+        self.api_key = api_key or os.environ.get("OPENAI_API_KEY") or os.environ.get("OPENAI_KEY")
+        self.timeout = timeout
+        self.max_tokens = int(max_tokens or os.environ.get("AUTOSOLVER_LLM_MAX_TOKENS", "8192"))
+        self.calls = []
+
+    @property
+    def enabled(self):
+        return bool(self.api_key and self.model)
+
+    def endpoint(self):
+        url = self.base_url.rstrip("/")
+        if url.endswith("/chat/completions"):
+            return url
+        return url + "/chat/completions"
+
+    def chat(self, messages, temperature=0.2, max_tokens=None):
+        if not self.enabled:
+            raise RuntimeError("LLM is not configured; set OPENAI_API_KEY or OPENAI_KEY")
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": int(max_tokens or self.max_tokens),
+        }
+        body = json.dumps(payload).encode("utf-8")
+        request = urllib.request.Request(
+            self.endpoint(),
+            data=body,
+            headers={
+                "Authorization": "Bearer " + self.api_key,
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        start = time.time()
+        try:
+            response = urllib.request.urlopen(request, timeout=self.timeout)
+            raw = response.read().decode("utf-8")
+            data = json.loads(raw)
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "ignore")
+            raise RuntimeError("LLM HTTPError {0}: {1}".format(exc.code, detail[:2000]))
+        elapsed = time.time() - start
+        message = data.get("choices", [{}])[0].get("message", {})
+        content = message.get("content", "")
+        self.calls.append({"model": self.model, "elapsed": elapsed, "chars": len(content)})
+        return content
+
+
+def _strip_code_fence(text):
+    text = (text or "").strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        return "\n".join(lines).strip()
+    return text
+
+
+def extract_python_code(text):
+    text = text or ""
+    blocks = re.findall(r"```(?:python|py)?\s*(.*?)```", text, flags=re.IGNORECASE | re.DOTALL)
+    for block in blocks:
+        code = _strip_code_fence(block)
+        if "def solve" in code:
+            return code.strip() + "\n"
+    if "def solve" in text:
+        start = text.find("def solve")
+        prefix_start = max(text.rfind("\nimport ", 0, start), text.rfind("\nfrom ", 0, start))
+        if prefix_start >= 0:
+            start = prefix_start + 1
+        return _strip_code_fence(text[start:]).strip() + "\n"
+    return ""
+
+
+def extract_json_value(text, default=None):
+    text = text or ""
+    blocks = re.findall(r"```json\s*(.*?)```", text, flags=re.IGNORECASE | re.DOTALL)
+    candidates = blocks + [text]
+    for candidate in candidates:
+        candidate = _strip_code_fence(candidate)
+        try:
+            return json.loads(candidate)
+        except Exception:
+            pass
+        spans = []
+        left = candidate.find("{")
+        right = candidate.rfind("}")
+        if left >= 0 and right > left:
+            spans.append(candidate[left:right + 1])
+        left = candidate.find("[")
+        right = candidate.rfind("]")
+        if left >= 0 and right > left:
+            spans.append(candidate[left:right + 1])
+        for span in spans:
+            try:
+                return json.loads(span)
+            except Exception:
+                continue
+    return default
+
+
+def truncate_text(value, limit):
+    value = value or ""
+    if len(value) <= limit:
+        return value
+    half = max(1, limit // 2)
+    return value[:half] + "\n...<truncated>...\n" + value[-half:]
+
+
+_HeuristicAutoSolverAgent = AutoSolverAgent
+
+
+class AutoSolverAgent(_HeuristicAutoSolverAgent):
+    """LLM-driven AutoSolver Agent.
+
+    The deterministic evaluator from the original agent is preserved, but task
+    analysis, candidate solver generation, result review/scoring, candidate
+    selection, and iterative optimization are delegated to an OpenAI-compatible
+    chat model whenever credentials are available.
+    """
+
+    def __init__(self, case_paths=None, output_path="generated_submit_solution.py", reference_solver_path="submit_solution.py", budget_seconds=90.0, per_case_timeout=10.0, seed=20260524, max_cases=3, use_llm=True, llm_model=None, llm_base_url=None, llm_api_key=None, llm_timeout=60.0, llm_temperature=0.2, llm_max_iterations=3, llm_candidates_per_round=2):
+        _HeuristicAutoSolverAgent.__init__(self, case_paths, output_path, reference_solver_path, budget_seconds, per_case_timeout, seed, max_cases)
+        self.use_llm = bool(use_llm)
+        self.llm = OpenAICompatibleChat(model=llm_model, base_url=llm_base_url, api_key=llm_api_key, timeout=llm_timeout)
+        self.llm_temperature = llm_temperature
+        self.llm_max_iterations = max(1, int(llm_max_iterations))
+        self.llm_candidates_per_round = max(1, int(llm_candidates_per_round))
+        self.llm_analysis = {}
+        self.llm_round_feedback = []
+        self.llm_notes = []
+        self.controller = "llm" if self.use_llm and self.llm.enabled else "heuristic_fallback"
+
+    def run(self):
+        self.cases = self.load_cases()
+        if not self.cases:
+            self.cases = self.synthetic_cases()
+        deadline = time.time() + self.budget_seconds
+        self.evaluate_reference()
+        if self.use_llm and self.llm.enabled:
+            self.controller = "llm"
+            self.run_llm_workflow(deadline)
+        else:
+            self.controller = "heuristic_fallback"
+            self.llm_notes.append("LLM disabled or missing API key; using original heuristic search loop.")
+            self.run_heuristic_workflow(deadline)
+        if self.best_result is None:
+            fallback = self.initial_specs()[0]
+            fallback["source"] = "last_resort_heuristic"
+            self.best_result = self.evaluate_spec(fallback)
+            self.history.append(self.best_result)
+        self.write_solver(self.best_result)
+        self.write_report()
+        return self.summary()
+
+    def run_heuristic_workflow(self, deadline):
+        frontier = self.initial_specs()
+        iteration = 0
+        while frontier and time.time() < deadline:
+            iteration += 1
+            next_results = []
+            for spec in frontier:
+                if time.time() >= deadline:
+                    break
+                result = self.evaluate_spec(spec)
+                result["source"] = spec.get("source", "heuristic")
+                self.history.append(result)
+                next_results.append(result)
+                if result["rank"] is not None and (self.best_result is None or result["rank"] < self.best_result["rank"]):
+                    self.best_result = result
+            frontier = self.propose_next(next_results, iteration, deadline)
+
+    def run_llm_workflow(self, deadline):
+        self.llm_analysis = self.llm_analyze_task(deadline)
+        frontier = self.llm_generate_candidates(iteration=0, recent_results=[], deadline=deadline)
+        if not frontier:
+            self.llm_notes.append("LLM did not produce valid initial code; seeding heuristic fallback candidates.")
+            frontier = self.initial_specs()[:max(1, self.llm_candidates_per_round)]
+            for spec in frontier:
+                spec["source"] = "heuristic_seed_after_llm_failure"
+        for iteration in range(1, self.llm_max_iterations + 1):
+            if time.time() >= deadline:
+                break
+            if not frontier:
+                frontier = self.llm_generate_candidates(iteration=iteration, recent_results=[], deadline=deadline)
+                if not frontier:
+                    break
+            recent_results = []
+            for spec in frontier:
+                if time.time() >= deadline:
+                    break
+                result = self.evaluate_or_reject_spec(spec)
+                result["llm_review"] = self.llm_review_result(result, iteration, deadline)
+                self.history.append(result)
+                recent_results.append(result)
+                if result.get("rank") is not None and (self.best_result is None or self.effective_rank(result) < self.effective_rank(self.best_result)):
+                    self.best_result = result
+            if recent_results:
+                self.llm_select_and_plan(recent_results, iteration, deadline)
+            if iteration >= self.llm_max_iterations:
+                break
+            if time.time() >= deadline:
+                break
+            frontier = self.llm_generate_candidates(iteration=iteration, recent_results=recent_results, deadline=deadline)
+        if self.best_result is None:
+            self.llm_notes.append("No usable LLM candidate survived evaluation; running heuristic loop for the remaining budget.")
+            self.run_heuristic_workflow(deadline)
+
+    def llm_messages(self, system, user):
+        return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+    def call_llm_text(self, system, user, temperature=None, max_tokens=None):
+        try:
+            return self.llm.chat(
+                self.llm_messages(system, user),
+                temperature=self.llm_temperature if temperature is None else temperature,
+                max_tokens=max_tokens,
+            )
+        except Exception as exc:
+            note = "LLM call failed: {0}".format(exc)
+            self.llm_notes.append(note)
+            return ""
+
+    def call_llm_json(self, system, user, default=None, temperature=None, max_tokens=None):
+        text = self.call_llm_text(system, user, temperature=temperature, max_tokens=max_tokens)
+        value = extract_json_value(text, default=default)
+        if value is default:
+            self.llm_notes.append("LLM JSON parsing failed; raw response: " + truncate_text(text, 600))
+        return value
+
+    def llm_analyze_task(self, deadline):
+        system = "你是算法竞赛 AutoSolver Agent 的任务分析器。你必须基于题意和样例数据拆解目标、约束、评分公式、输出契约和可行算法方向。只返回 JSON。"
+        user = (
+            "题目说明:\n{desc}\n\n"
+            "数据集摘要:\n{summary}\n\n"
+            "请返回 JSON: {{\"objective\": str, \"constraints\": [str], \"scoring\": str, "
+            "\"output_contract\": str, \"algorithm_ideas\": [str], \"risks\": [str]}}。"
+        ).format(desc=self.read_problem_description(), summary=json.dumps(self.dataset_summary(), ensure_ascii=False, indent=2))
+        analysis = self.call_llm_json(system, user, default={}, temperature=0.1, max_tokens=2048)
+        if not isinstance(analysis, dict) or not analysis:
+            analysis = {
+                "objective": "最大化覆盖任务数，在覆盖相同的情况下最小化期望惩罚。",
+                "constraints": ["任务不能重复覆盖", "骑手不能重复使用", "每个输出任务组必须存在且骑手必须可服务该任务组"],
+                "scoring": "本地评估器计算 failures、覆盖数、总 penalty 和运行时间。",
+                "output_contract": "solve(input_text: str) -> list[(task_key, [courier_id, ...])]",
+                "algorithm_ideas": ["贪心", "beam search", "局部搜索", "多骑手补充降低拒单风险"],
+                "risks": ["LLM 生成代码可能超时或违反输出契约"],
+            }
+        self.llm_notes.append("LLM task analysis completed with {0} idea(s).".format(len(analysis.get("algorithm_ideas", []))))
+        return analysis
+
+    def llm_generate_candidates(self, iteration, recent_results, deadline):
+        candidates = []
+        for index in range(self.llm_candidates_per_round):
+            if time.time() >= deadline:
+                break
+            text = self.llm_generate_one_candidate(iteration, index, recent_results, deadline)
+            code = extract_python_code(text)
+            meta = extract_json_value(text, default={})
+            if not code:
+                self.llm_notes.append("LLM candidate generation returned no Python solve() code at iteration {0}.".format(iteration))
+                continue
+            name = "llm_iter{0}_cand{1}".format(iteration, index + 1)
+            if isinstance(meta, dict) and meta.get("name"):
+                name = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(meta.get("name")))[:80] or name
+            candidates.append({
+                "name": name,
+                "config": {"llm_generated": True, "iteration": iteration, "candidate_index": index, "meta": meta if isinstance(meta, dict) else {}},
+                "code": code,
+                "source": "llm_generated",
+            })
+        return candidates
+
+    def llm_generate_one_candidate(self, iteration, index, recent_results, deadline):
+        system = (
+            "你是一个资深 Python 算法工程师，正在为配送分配问题生成可提交求解器。"
+            "必须生成完整 Python 代码，且只依赖标准库。代码必须定义 solve(input_text: str) -> list。"
+            "禁止文件 IO、网络 IO、subprocess、eval、exec。优先保证不超时和输出合法。"
+        )
+        user = (
+            "任务分析 JSON:\n{analysis}\n\n"
+            "输入/输出/评分契约:\n{contract}\n\n"
+            "当前数据摘要:\n{summary}\n\n"
+            "参考/历史结果摘要:\n{history}\n\n"
+            "上一轮 LLM 反馈:\n{feedback}\n\n"
+            "请生成第 {cand_no} 个候选求解器，iteration={iteration}，剩余总预算约 {time_left:.1f}s。"
+            "候选应与已有思路有差异，并面向反馈改进。\n"
+            "输出格式必须包含一个 JSON 元数据代码块和一个 Python 代码块，例如:\n"
+            "```json\n{{\"name\": \"short_name\", \"idea\": \"...\"}}\n```\n"
+            "```python\n# complete solver code here\n```"
+        ).format(
+            analysis=json.dumps(self.llm_analysis, ensure_ascii=False, indent=2),
+            contract=self.solver_contract(),
+            summary=json.dumps(self.dataset_summary(), ensure_ascii=False, indent=2),
+            history=json.dumps(self.history_summary(limit=6, include_reviews=True), ensure_ascii=False, indent=2),
+            feedback=json.dumps(self.llm_round_feedback[-3:], ensure_ascii=False, indent=2),
+            cand_no=index + 1,
+            iteration=iteration,
+            time_left=max(0.0, deadline - time.time()),
+        )
+        return self.call_llm_text(system, user, temperature=0.25 + 0.1 * min(index, 3), max_tokens=self.llm.max_tokens)
+
+    def evaluate_or_reject_spec(self, spec):
+        reason = self.validate_candidate_code(spec.get("code", ""))
+        if reason:
+            return self.rejected_result(spec, reason)
+        return self.evaluate_spec(spec)
+
+    def validate_candidate_code(self, code):
+        if not code or "def solve" not in code:
+            return "missing solve(input_text) function"
+        lowered = code.lower()
+        forbidden = [
+            "subprocess", "socket", "requests", "urllib", "http.client", "ftplib",
+            "paramiko", "open(", "eval(", "exec(", "compile(", "__import__", "import os",
+            "from os", "import sys", "from sys",
+        ]
+        for token in forbidden:
+            if token in lowered:
+                return "forbidden token in generated solver: " + token
+        try:
+            compile(code, "<llm_candidate_validation>", "exec")
+        except Exception as exc:
+            return "compile error: " + str(exc)
+        return None
+
+    def rejected_result(self, spec, reason):
+        total_tasks = 0
+        cases = []
+        total_penalty = 0.0
+        for case in self.cases:
+            parsed = self.parse_case(case["text"])
+            tasks = len(parsed["all_tasks"])
+            total_tasks += tasks
+            penalty = 1000000.0 + 100.0 * tasks
+            total_penalty += penalty
+            cases.append({"case": case["name"], "status": "rejected", "covered": 0, "tasks": tasks, "penalty": penalty, "runtime": 0.0, "error": reason})
+        return {
+            "name": spec.get("name", "rejected"),
+            "config": copy.deepcopy(spec.get("config", {})),
+            "code": spec.get("code", ""),
+            "rank": (len(self.cases), 0, total_penalty, 0.0),
+            "cases": cases,
+            "total_covered": 0,
+            "total_tasks": total_tasks,
+            "total_penalty": total_penalty,
+            "total_runtime": 0.0,
+            "failures": len(self.cases),
+            "source": spec.get("source", "llm_generated"),
+            "rejected_reason": reason,
+        }
+
+    def llm_review_result(self, result, iteration, deadline):
+        system = (
+            "你是 AutoSolver Agent 的评估与评分器。你会收到本地沙箱运行指标，"
+            "必须基于 failures、covered、penalty、runtime、错误信息对候选求解器打分，并给出下一步优化建议。"
+            "只返回 JSON。"
+        )
+        user = (
+            "候选结果:\n{result}\n\n"
+            "当前 best:\n{best}\n\n"
+            "评分规则: failures 越少越好；covered 越多越好；penalty 越低越好；runtime 越低越好。"
+            "请返回 JSON: {{\"score\": 0-100, \"keep\": bool, \"diagnosis\": str, "
+            "\"suggested_changes\": [str], \"next_strategy\": str}}。"
+        ).format(
+            result=json.dumps(self.compact_result(result), ensure_ascii=False, indent=2),
+            best=json.dumps(self.compact_result(self.best_result), ensure_ascii=False, indent=2) if self.best_result else "null",
+        )
+        review = self.call_llm_json(system, user, default={}, temperature=0.1, max_tokens=1536)
+        if not isinstance(review, dict) or not review:
+            review = self.default_llm_review(result)
+        review["iteration"] = iteration
+        return review
+
+    def llm_select_and_plan(self, recent_results, iteration, deadline):
+        system = (
+            "你是 AutoSolver Agent 的迭代优化控制器。你需要比较最近候选和历史 best，"
+            "决定保留哪个方向，并为下一轮代码生成提出明确优化计划。只返回 JSON。"
+        )
+        user = (
+            "最近候选:\n{recent}\n\n"
+            "历史 Top 候选:\n{history}\n\n"
+            "任务分析:\n{analysis}\n\n"
+            "请返回 JSON: {{\"chosen\": \"候选名\", \"reason\": str, \"next_focus\": str, "
+            "\"avoid\": [str], \"code_change_requests\": [str]}}。"
+        ).format(
+            recent=json.dumps([self.compact_result(r) for r in recent_results], ensure_ascii=False, indent=2),
+            history=json.dumps(self.history_summary(limit=5, include_reviews=True), ensure_ascii=False, indent=2),
+            analysis=json.dumps(self.llm_analysis, ensure_ascii=False, indent=2),
+        )
+        feedback = self.call_llm_json(system, user, default={}, temperature=0.15, max_tokens=1536)
+        if not isinstance(feedback, dict):
+            feedback = {}
+        self.llm_round_feedback.append(feedback)
+        chosen = feedback.get("chosen")
+        if chosen:
+            for result in recent_results:
+                if result.get("name") == chosen and result.get("rank") is not None:
+                    if self.best_result is None or self.effective_rank(result) <= self.effective_rank(self.best_result):
+                        self.best_result = result
+                    break
+
+    def default_llm_review(self, result):
+        failures = result.get("failures", 0)
+        total_tasks = max(1, result.get("total_tasks", 0))
+        covered = result.get("total_covered", 0)
+        coverage_score = 60.0 * covered / total_tasks
+        failure_penalty = 30.0 * failures
+        penalty_score = max(0.0, 40.0 - result.get("total_penalty", 0.0) / max(1.0, total_tasks * 5.0))
+        score = max(0.0, min(100.0, coverage_score + penalty_score - failure_penalty))
+        return {
+            "score": round(score, 3),
+            "keep": failures == 0,
+            "diagnosis": "Fallback deterministic review because LLM scoring response was unavailable.",
+            "suggested_changes": ["Fix validity/runtime first" if failures else "Try lower penalty local search"],
+            "next_strategy": "repair" if failures else "optimize_penalty",
+        }
+
+    def effective_rank(self, result):
+        if result is None:
+            return (10 ** 9, 0, 10 ** 18, 0.0, 10 ** 18)
+        rank = result.get("rank") or (10 ** 9, 0, 10 ** 18, 10 ** 18)
+        review = result.get("llm_review") or {}
+        try:
+            llm_score = float(review.get("score", 0.0))
+        except Exception:
+            llm_score = 0.0
+        return (rank[0], rank[1], rank[2], -llm_score, rank[3])
+
+    def read_problem_description(self):
+        try:
+            with open("describe.txt", "r") as handle:
+                return handle.read()
+        except Exception:
+            return "配送任务-骑手分配问题。"
+
+    def solver_contract(self):
+        return (
+            "输入是 TSV 文本，表头为 task_id_list, courier_id, total_score, willingness。"
+            "task_id_list 可以是单任务或逗号分隔的合单任务。solve 必须返回 list，"
+            "元素形如 (task_key: str, couriers: list[str])。约束: 任务不能重复；骑手不能重复；"
+            "每个骑手必须存在于该 task_key 的候选数据中。评分: 未覆盖任务每个罚 100；"
+            "已覆盖任务组 penalty = P(全拒)*100*任务数 + P(有人接)*(按 willingness 加权平均 score)。"
+            "排序目标是 (failures, -covered, total_penalty, runtime) 最小。"
+        )
+
+    def dataset_summary(self):
+        summaries = []
+        for case in self.cases:
+            parsed = self.parse_case(case["text"])
+            rows = parsed["rows"]
+            couriers = sorted(set(courier for _, _, courier, _, _ in rows))
+            scores = [score for _, _, _, score, _ in rows]
+            willingness = [will for _, _, _, _, will in rows]
+            pair_rows = sum(1 for tasks, _, _, _, _ in rows if len(tasks) > 1)
+            sample_lines = case["text"].splitlines()[:8]
+            summaries.append({
+                "name": case["name"],
+                "rows": len(rows),
+                "tasks": len(parsed["all_tasks"]),
+                "couriers": len(couriers),
+                "pair_row_ratio": round(pair_rows / float(max(1, len(rows))), 4),
+                "avg_score": round(sum(scores) / float(max(1, len(scores))), 4) if scores else 0.0,
+                "avg_willingness": round(sum(willingness) / float(max(1, len(willingness))), 4) if willingness else 0.0,
+                "sample": sample_lines,
+            })
+        return {"case_count": len(self.cases), "cases": summaries, "per_case_timeout": self.per_case_timeout, "budget_seconds": self.budget_seconds}
+
+    def compact_result(self, result):
+        if result is None:
+            return None
+        return {
+            "name": result.get("name"),
+            "source": result.get("source", result.get("config", {}).get("source")),
+            "rank": list(result.get("rank", [])),
+            "covered": result.get("total_covered"),
+            "tasks": result.get("total_tasks"),
+            "penalty": round(result.get("total_penalty", 0.0), 4),
+            "runtime": round(result.get("total_runtime", 0.0), 4),
+            "failures": result.get("failures"),
+            "cases": result.get("cases", [])[:3],
+            "llm_review": result.get("llm_review"),
+            "rejected_reason": result.get("rejected_reason"),
+        }
+
+    def history_summary(self, limit=5, include_reviews=False):
+        ordered = sorted(self.history, key=lambda result: self.effective_rank(result))[:limit]
+        output = []
+        for result in ordered:
+            item = self.compact_result(result)
+            if not include_reviews and item:
+                item.pop("llm_review", None)
+            output.append(item)
+        return output
+
+    def summary(self):
+        result = _HeuristicAutoSolverAgent.summary(self)
+        result["controller"] = self.controller
+        result["llm"] = {
+            "enabled": bool(self.use_llm and self.llm.enabled),
+            "model": self.llm.model,
+            "base_url": self.llm.base_url,
+            "calls": len(self.llm.calls),
+            "call_stats": self.llm.calls[-10:],
+            "max_iterations": self.llm_max_iterations,
+            "candidates_per_round": self.llm_candidates_per_round,
+        }
+        result["llm_analysis"] = self.llm_analysis
+        result["llm_round_feedback"] = self.llm_round_feedback[-10:]
+        result["llm_notes"] = self.llm_notes[-20:]
+        result["history_top"] = self.history_summary(limit=5, include_reviews=True)
+        return result
 
 
 def main():

@@ -25,6 +25,7 @@ import json
 import multiprocessing
 import os
 import random
+import re
 import statistics
 import time
 import traceback
@@ -331,6 +332,12 @@ class AgentContext:
         self.verbose = verbose
         self.parsed_cases: List[Dict[str, Any]] = [parse_case(c["text"]) for c in cases]
         self.features: List[Dict[str, Any]] = [dataset_features(p) for p in self.parsed_cases]
+        self.problem_description: str = ""
+        self.task_analysis: Dict[str, Any] = {}
+        self.strategy_plan: List[Dict[str, Any]] = []
+        self.round_reviews: List[Dict[str, Any]] = []
+        self.final_reason: str = ""
+        self.controller_mode: str = "heuristic"
         self.history: List[Dict[str, Any]] = []
         self.best: Optional[Dict[str, Any]] = None
         self.reference: Optional[Dict[str, Any]] = None
@@ -588,6 +595,224 @@ def _profile_names(profiles: List[Dict[str, Any]]) -> List[str]:
     return out
 
 
+def _short_text(text: str, limit: int = 6000) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "\n...[truncated]..."
+
+
+def _message_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict):
+                parts.append(str(item.get("text") or item.get("content") or item))
+            else:
+                parts.append(str(item))
+        return "\n".join(parts)
+    return str(content)
+
+
+def _extract_json_value(text: str, default: Any) -> Any:
+    if not text:
+        return default
+    candidates = []
+    for match in re.finditer(r"```(?:json)?\s*(.*?)```", text, re.DOTALL | re.IGNORECASE):
+        candidates.append(match.group(1).strip())
+    candidates.append(text.strip())
+    for candidate in candidates:
+        try:
+            return json.loads(candidate)
+        except Exception:
+            pass
+    starts = [idx for idx in (text.find("{"), text.find("[")) if idx >= 0]
+    if not starts:
+        return default
+    start = min(starts)
+    for end in range(len(text), start, -1):
+        chunk = text[start:end].strip()
+        try:
+            return json.loads(chunk)
+        except Exception:
+            continue
+    return default
+
+
+def _llm_json(
+    ctx: AgentContext,
+    llm: Optional["ChatOpenAI"],
+    stage: str,
+    system: str,
+    user: str,
+    default: Any,
+) -> Any:
+    if llm is None:
+        return default
+    try:
+        response = llm.invoke([SystemMessage(content=system), HumanMessage(content=user)])
+        value = _extract_json_value(_message_text(getattr(response, "content", "")), default)
+        if value is default:
+            ctx.log(f"LLM {stage}: JSON parse failed")
+        else:
+            ctx.log(f"LLM {stage}: completed")
+        return value
+    except Exception as exc:
+        ctx.log(f"LLM {stage} failed: {exc}")
+        return default
+
+
+def _sanitize_name(name: Any, fallback: str) -> str:
+    value = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(name or fallback)).strip("_")
+    return value[:80] or fallback
+
+
+def _compact_result(result: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if result is None:
+        return None
+    return {
+        "name": result.get("name"),
+        "rank": list(result.get("rank", [])),
+        "covered": result.get("total_covered"),
+        "tasks": result.get("total_tasks"),
+        "penalty": round(float(result.get("total_penalty", 0.0)), 4),
+        "runtime": round(float(result.get("total_runtime", 0.0)), 4),
+        "failures": result.get("failures"),
+        "cases": result.get("cases", [])[:3],
+    }
+
+
+def _history_summary(ctx: AgentContext, limit: int = 6) -> List[Dict[str, Any]]:
+    ordered = sorted(ctx.history, key=lambda r: r["rank"])[:max(1, limit)]
+    return [item for item in (_compact_result(result) for result in ordered) if item]
+
+
+def _dataset_snapshot(ctx: AgentContext, sample_lines: int = 8) -> Dict[str, Any]:
+    cases = []
+    for case, feat in zip(ctx.cases, ctx.features):
+        cases.append({
+            "name": case["name"],
+            "features": feat,
+            "sample": case["text"].splitlines()[:sample_lines],
+        })
+    return {
+        "summary": ctx.aggregate_features(),
+        "cases": cases,
+        "per_case_timeout": ctx.per_case_timeout,
+        "search_per_case_timeout": ctx.search_per_case_timeout,
+        "time_left": round(ctx.time_left(), 2),
+    }
+
+
+def _default_task_analysis(ctx: AgentContext) -> Dict[str, Any]:
+    return {
+        "task_type": "delivery_assignment",
+        "objective": "最大化有效覆盖任务数；覆盖相同的情况下最小化总期望罚分。",
+        "constraints": [
+            "同一个任务不能在输出中重复出现。",
+            "同一个骑手不能在输出中重复使用。",
+            "输出的任务组必须存在于输入候选组合中。",
+            "任务组内的骑手必须都能服务该任务组。",
+        ],
+        "scoring": "本地评分器按 rank=(failures, -covered, total_penalty, total_runtime) 排序。",
+        "output_contract": "生成的 Python 求解器必须定义 solve(input_text: str) -> list[(task_key, [courier_id, ...])]。",
+        "strategy_space": ["greedy", "weighted_greedy", "min_cost_flow", "beam_search", "local_search", "simulated_annealing"],
+        "risks": ["策略重复导致搜索浪费", "过重的策略在 10 秒单测限制内超时", "合单任务与单任务之间可能冲突"],
+    }
+
+
+def _normalise_strategy_specs(raw: Any) -> List[Dict[str, Any]]:
+    if isinstance(raw, dict):
+        items = raw.get("strategies", [])
+    elif isinstance(raw, list):
+        items = raw
+    else:
+        items = []
+    return [item for item in items if isinstance(item, dict)]
+
+
+def _strategy_from_spec(
+    ctx: AgentContext,
+    spec: Dict[str, Any],
+    fallback_name: str,
+) -> Optional[Dict[str, Any]]:
+    profiles = spec.get("profiles", [])
+    if isinstance(profiles, str):
+        profiles = [profiles]
+    valid_profiles = [p for p in profiles if isinstance(p, str) and p in PROFILE_LIBRARY]
+    if not valid_profiles:
+        return None
+    overrides: Dict[str, Any] = {}
+    int_limits = {
+        "extra_limit": (0, 400),
+        "local_rounds": (0, 10),
+        "loop_local_rounds": (0, 10),
+        "max_local_keys": (10, 300),
+        "beam_width": (10, 600),
+        "beam_keep_per_group": (1, 12),
+        "beam_task_limit": (8, 80),
+        "sa_iters_per_temp": (1, 200),
+    }
+    float_limits = {
+        "sa_temp": (1.0, 120.0),
+        "sa_cooling": (0.70, 0.99),
+        "sa_min_temp": (0.05, 5.0),
+        "loop_random_weight": (0.0, 40.0),
+        "mutate_coverage": (0.0, 80.0),
+        "mutate_pair": (0.0, 120.0),
+        "mutate_willingness": (0.0, 100.0),
+    }
+    extra = spec.get("overrides") if isinstance(spec.get("overrides"), dict) else {}
+    merged = dict(extra)
+    merged.update({k: v for k, v in spec.items() if k in int_limits or k in float_limits})
+    for key, (lo, hi) in int_limits.items():
+        if key in merged and merged[key] is not None:
+            try:
+                overrides[key] = max(lo, min(hi, int(merged[key])))
+            except Exception:
+                pass
+    for key, (lo, hi) in float_limits.items():
+        if key in merged and merged[key] is not None:
+            try:
+                overrides[key] = max(lo, min(hi, float(merged[key])))
+            except Exception:
+                pass
+    seed_delta = spec.get("seed_delta", ctx.rng.randrange(1, 99991))
+    try:
+        seed = ctx.seed + int(seed_delta)
+    except Exception:
+        seed = ctx.seed + ctx.rng.randrange(1, 99991)
+    strategy = make_strategy(
+        name=_sanitize_name(spec.get("name"), fallback_name),
+        seed=seed,
+        per_case_timeout=ctx.search_per_case_timeout,
+        profile_names=valid_profiles,
+        use_flow=bool(spec.get("use_flow", False)),
+        use_beam=bool(spec.get("use_beam", False)),
+        use_sa=bool(spec.get("use_sa", False)),
+        overrides=overrides,
+    )
+    strategy["idea"] = str(spec.get("idea", ""))
+    return strategy
+
+
+def _fallback_seed_strategies(ctx: AgentContext) -> int:
+    accepted = 0
+    for recipe in INITIAL_STRATEGY_RECIPES:
+        strategy = make_strategy(
+            name=recipe["name"],
+            seed=ctx.seed,
+            per_case_timeout=ctx.search_per_case_timeout,
+            profile_names=recipe["profiles"],
+            use_flow=recipe.get("use_flow", False),
+            use_beam=recipe.get("use_beam", False),
+            use_sa=recipe.get("use_sa", False),
+        )
+        accepted += int(ctx.enqueue(strategy))
+    return accepted
+
+
 def build_tools(ctx: AgentContext) -> Tuple[List[StructuredTool], Dict[str, StructuredTool]]:
     """构造工具集合, 工具内部直接读写 ctx."""
 
@@ -780,23 +1005,31 @@ def build_tools(ctx: AgentContext) -> Tuple[List[StructuredTool], Dict[str, Stru
 # ===========================================================================
 
 class AgentState(TypedDict, total=False):
-    phase: str            # setup / analyze / loop / finalize
+    phase: str
     iteration: int
     finalized: bool
     last_action: str
     note: str
+    queued: int
+    recent_results: List[Dict[str, Any]]
+    review: Dict[str, Any]
 
 
-def make_setup_node(ctx: AgentContext, reference_path: Optional[str]):
+def make_receive_input_node(ctx: AgentContext, reference_path: Optional[str]):
     def node(state: AgentState) -> AgentState:
         ctx.log(f"loaded {len(ctx.cases)} case(s); per-case timeout={ctx.per_case_timeout:.1f}s")
+        try:
+            with open("describe.txt", "r") as handle:
+                ctx.problem_description = handle.read()
+        except Exception:
+            ctx.problem_description = "配送任务-骑手分配问题。"
         ctx.evaluate_reference(reference_path)
         return {"phase": "analyze", "iteration": 0, "finalized": False}
 
     return node
 
 
-def make_analyze_node(ctx: AgentContext):
+def make_analyze_task_node(ctx: AgentContext, llm: Optional["ChatOpenAI"] = None):
     def node(state: AgentState) -> AgentState:
         agg = ctx.aggregate_features()
         ctx.log(
@@ -808,19 +1041,210 @@ def make_analyze_node(ctx: AgentContext):
                 will=float(agg.get("avg_willingness") or 0.0),
             )
         )
-        # 注入 8 个初始策略, 覆盖主流方向, 给后续控制器留迭代空间.
-        for recipe in INITIAL_STRATEGY_RECIPES:
-            strategy = make_strategy(
-                name=recipe["name"],
-                seed=ctx.seed,
-                per_case_timeout=ctx.search_per_case_timeout,
-                profile_names=recipe["profiles"],
-                use_flow=recipe.get("use_flow", False),
-                use_beam=recipe.get("use_beam", False),
-                use_sa=recipe.get("use_sa", False),
+        default = _default_task_analysis(ctx)
+        if llm is None:
+            ctx.task_analysis = default
+            ctx.log("task analysis: using offline fallback")
+        else:
+            system = (
+                "你是通用 AutoSolver Agent 的任务分析器。你必须根据任务描述和输入数据摘要拆解求解目标、"
+                "硬约束、评分/比较规则、输出形式、可尝试策略空间和主要风险。只返回 JSON。"
             )
-            ctx.enqueue(strategy)
-        return {"phase": "loop", "note": "seeded initial strategies"}
+            user = (
+                "任务描述:\n{desc}\n\n"
+                "输入数据快照:\n{snapshot}\n\n"
+                "请返回 JSON: {{"
+                "\"task_type\": str, \"objective\": str, \"constraints\": [str], "
+                "\"scoring\": str, \"output_contract\": str, \"strategy_space\": [str], \"risks\": [str]"
+                "}}。"
+            ).format(
+                desc=_short_text(ctx.problem_description, 5000),
+                snapshot=json.dumps(_dataset_snapshot(ctx), ensure_ascii=False, indent=2),
+            )
+            value = _llm_json(ctx, llm, "task_analysis", system, user, default)
+            ctx.task_analysis = value if isinstance(value, dict) else default
+        return {"phase": "generate", "note": "task analyzed"}
+
+    return node
+
+
+def make_strategy_generation_node(ctx: AgentContext, llm: Optional["ChatOpenAI"] = None):
+    def node(state: AgentState) -> AgentState:
+        margin = ctx.search_per_case_timeout * len(ctx.cases) + 0.5
+        if ctx.out_of_time(margin=margin):
+            return {"phase": "finalize", "queued": 0, "note": "search budget exhausted"}
+
+        specs: List[Dict[str, Any]] = []
+        source = "heuristic_fallback"
+        if llm is not None:
+            default = {"strategies": []}
+            system = (
+                "你是通用 AutoSolver Agent 的策略生成器。你必须根据任务分析、数据摘要和历史评估结果，"
+                "提出多样化且可执行的求解策略。只能返回 JSON。"
+            )
+            user = (
+                "任务分析:\n" + json.dumps(ctx.task_analysis, ensure_ascii=False, indent=2) +
+                "\n\n数据摘要:\n" + json.dumps(_dataset_snapshot(ctx), ensure_ascii=False, indent=2) +
+                "\n\n历史最优:\n" + json.dumps(_history_summary(ctx, limit=6), ensure_ascii=False, indent=2) +
+                "\n\n上一轮评估反馈:\n" + json.dumps(ctx.round_reviews[-3:], ensure_ascii=False, indent=2) +
+                "\n\n可用 profile: " + ", ".join(PROFILE_LIBRARY.keys()) +
+                "\n可用开关: use_flow, use_beam, use_sa。"
+                "\n请返回 JSON: {\"strategies\": [{\"name\": str, \"idea\": str, \"profiles\": [str], "
+                "\"use_flow\": bool, \"use_beam\": bool, \"use_sa\": bool, "
+                "\"extra_limit\": int|null, \"local_rounds\": int|null, \"seed_delta\": int|null, "
+                "\"overrides\": object}]}"
+            )
+            raw = _llm_json(ctx, llm, "strategy_generation", system, user, default)
+            specs = _normalise_strategy_specs(raw)
+            source = "llm"
+
+        accepted = 0
+        compact_specs = []
+        for index, spec in enumerate(specs[:4]):
+            strategy = _strategy_from_spec(ctx, spec, "llm_strategy_%03d" % (ctx.iteration + index + 1))
+            if strategy is None:
+                continue
+            if ctx.enqueue(strategy):
+                accepted += 1
+                compact_specs.append({
+                    "name": strategy["name"],
+                    "idea": strategy.get("idea", ""),
+                    "profiles": spec.get("profiles", []),
+                    "use_flow": strategy["config"].get("use_flow"),
+                    "use_beam": strategy["config"].get("use_beam"),
+                    "use_sa": strategy["config"].get("use_sa"),
+                })
+
+        if accepted == 0:
+            if not ctx.history:
+                accepted = _fallback_seed_strategies(ctx)
+                source = "fallback_seed"
+            else:
+                focus_cycle = ["balanced", "coverage", "bundle", "willingness", "diversify"]
+                review = ctx.round_reviews[-1] if ctx.round_reviews else {}
+                focus = str(review.get("next_focus") or review.get("recommended_focus") or "").lower()
+                if focus not in focus_cycle:
+                    focus = focus_cycle[ctx.iteration % len(focus_cycle)]
+                start = focus_cycle.index(focus)
+                for offset in range(min(3, len(focus_cycle))):
+                    candidate = _mutate_from_history(ctx, focus_cycle[(start + offset) % len(focus_cycle)], ctx.rng)
+                    if candidate is not None and ctx.enqueue(candidate):
+                        accepted += 1
+                source = "fallback_mutation"
+
+        ctx.strategy_plan.append({
+            "iteration": ctx.iteration,
+            "source": source,
+            "accepted": accepted,
+            "pending": len(ctx.pending),
+            "strategies": compact_specs,
+        })
+        ctx.log(f"strategy generation: source={source}, queued={accepted}, pending={len(ctx.pending)}")
+        return {"phase": "execute", "queued": accepted, "note": source}
+
+    return node
+
+
+def make_strategy_execution_node(ctx: AgentContext):
+    def node(state: AgentState) -> AgentState:
+        recent_results: List[Dict[str, Any]] = []
+        margin = ctx.search_per_case_timeout * len(ctx.cases) + 0.5
+        while ctx.pending and not ctx.out_of_time(margin=margin):
+            strategy = ctx.pending.pop(0)
+            ctx.iteration += 1
+            result = ctx.evaluate_strategy(strategy)
+            compact = _compact_result(result)
+            if compact:
+                recent_results.append(compact)
+        if not recent_results and not ctx.history and not ctx.out_of_time(margin=margin):
+            fallback = make_strategy(
+                "expected_greedy_fallback",
+                ctx.seed,
+                ctx.search_per_case_timeout,
+                ["expected", "coverage", "willingness"],
+            )
+            ctx.iteration += 1
+            result = ctx.evaluate_strategy(fallback)
+            compact = _compact_result(result)
+            if compact:
+                recent_results.append(compact)
+        ctx.log(f"strategy execution: evaluated={len(recent_results)}, best={ctx.best['name'] if ctx.best else None}")
+        return {"phase": "review", "recent_results": recent_results}
+
+    return node
+
+
+def make_evaluate_screen_node(ctx: AgentContext, llm: Optional["ChatOpenAI"] = None):
+    def node(state: AgentState) -> AgentState:
+        recent_results = state.get("recent_results", [])
+        best = _compact_result(ctx.best)
+        default = {
+            "accepted_best": best.get("name") if best else None,
+            "keep": bool(best),
+            "diagnosis": "使用本地 rank 自动筛选：failures 更少、covered 更多、penalty 更低者保留。",
+            "is_improved": bool(recent_results),
+            "next_focus": "balanced",
+            "strategy_adjustments": ["继续从历史 Top 候选中做局部变异。"],
+            "continue": True,
+        }
+        if recent_results:
+            first = recent_results[0]
+            if first.get("failures", 0) > 0:
+                default["next_focus"] = "coverage"
+            elif ctx.aggregate_features().get("pair_ratio", 0.0) > 0.2:
+                default["next_focus"] = "bundle"
+            else:
+                default["next_focus"] = "willingness"
+
+        if llm is not None:
+            system = (
+                "你是 AutoSolver Agent 的评估筛选器。你会收到候选策略的本地运行指标，"
+                "需要判断是否优于当前最优解，并给出下一轮策略调整方向。只能返回 JSON。"
+            )
+            user = (
+                "本轮候选结果:\n" + json.dumps(recent_results, ensure_ascii=False, indent=2) +
+                "\n\n当前 best:\n" + json.dumps(best, ensure_ascii=False, indent=2) +
+                "\n\nreference 基线:\n" + json.dumps(_compact_result(ctx.reference), ensure_ascii=False, indent=2) +
+                "\n\n历史 Top:\n" + json.dumps(_history_summary(ctx, limit=6), ensure_ascii=False, indent=2) +
+                "\n\n比较规则: failures 越少越好；covered 越多越好；penalty 越低越好；runtime 只做次级比较。"
+                "\n请返回 JSON: {\"accepted_best\": str|null, \"keep\": bool, \"is_improved\": bool, "
+                "\"diagnosis\": str, \"next_focus\": str, \"strategy_adjustments\": [str], "
+                "\"continue\": bool, \"final_reason\": str|null}"
+            )
+            value = _llm_json(ctx, llm, "evaluation_screening", system, user, default)
+            review = value if isinstance(value, dict) else default
+        else:
+            review = default
+
+        chosen_name = review.get("accepted_best")
+        if chosen_name:
+            for result in ctx.history:
+                if result.get("name") == chosen_name:
+                    if ctx.best is None or result["rank"] <= ctx.best["rank"]:
+                        ctx.best = result
+                    break
+        review["iteration"] = ctx.iteration
+        ctx.round_reviews.append(review)
+        ctx.log(f"evaluation screening: keep={review.get('keep')} next_focus={review.get('next_focus')}")
+        return {"phase": "improve", "review": review}
+
+    return node
+
+
+def make_iterate_improve_node(ctx: AgentContext):
+    def node(state: AgentState) -> AgentState:
+        review = state.get("review", {})
+        margin = ctx.search_per_case_timeout * len(ctx.cases) + 0.5
+        if ctx.out_of_time(margin=margin):
+            ctx.final_reason = "时间预算不足，输出当前 best。"
+            return {"phase": "finalize", "finalized": False}
+        if ctx.best is not None and review.get("continue") is False:
+            ctx.final_reason = str(review.get("final_reason") or "LLM/控制器判断继续收益较低，输出当前 best。")
+            return {"phase": "finalize", "finalized": False}
+        if not state.get("recent_results") and not ctx.pending and ctx.history:
+            ctx.final_reason = "本轮没有新策略被执行，输出当前 best。"
+            return {"phase": "finalize", "finalized": False}
+        return {"phase": "generate", "iteration": ctx.iteration}
 
     return node
 
@@ -1066,25 +1490,40 @@ def maybe_build_llm() -> Optional["ChatOpenAI"]:
 
 
 def build_graph(ctx: AgentContext, output_path: str, reference_path: Optional[str], use_llm: bool):
-    tools, _ = build_tools(ctx)
     builder = StateGraph(AgentState)
-    builder.add_node("setup", make_setup_node(ctx, reference_path))
-    builder.add_node("analyze", make_analyze_node(ctx))
+    llm = None
     if use_llm:
         llm = maybe_build_llm()
         if llm is None:
             use_llm = False
     if use_llm:
-        builder.add_node("loop", llm_loop_node(ctx, llm, tools))  # type: ignore
+        ctx.controller_mode = "llm"
         ctx.log("controller: LLM (langchain_openai)")
     else:
-        builder.add_node("loop", heuristic_loop_node(ctx))
+        ctx.controller_mode = "heuristic"
         ctx.log("controller: heuristic (offline)")
+    builder.add_node("receive_input", make_receive_input_node(ctx, reference_path))
+    builder.add_node("analyze_task", make_analyze_task_node(ctx, llm))
+    builder.add_node("strategy_generation", make_strategy_generation_node(ctx, llm))
+    builder.add_node("strategy_execution", make_strategy_execution_node(ctx))
+    builder.add_node("evaluate_screen", make_evaluate_screen_node(ctx, llm))
+    builder.add_node("iterate_improve", make_iterate_improve_node(ctx))
     builder.add_node("finalize", make_finalize_node(ctx, output_path))
-    builder.set_entry_point("setup")
-    builder.add_edge("setup", "analyze")
-    builder.add_edge("analyze", "loop")
-    builder.add_edge("loop", "finalize")
+    builder.set_entry_point("receive_input")
+    builder.add_edge("receive_input", "analyze_task")
+    builder.add_edge("analyze_task", "strategy_generation")
+    builder.add_conditional_edges(
+        "strategy_generation",
+        lambda state: state.get("phase", "execute"),
+        {"execute": "strategy_execution", "finalize": "finalize"},
+    )
+    builder.add_edge("strategy_execution", "evaluate_screen")
+    builder.add_edge("evaluate_screen", "iterate_improve")
+    builder.add_conditional_edges(
+        "iterate_improve",
+        lambda state: state.get("phase", "finalize"),
+        {"generate": "strategy_generation", "finalize": "finalize"},
+    )
     builder.add_edge("finalize", END)
     return builder.compile()
 
@@ -1219,7 +1658,12 @@ class AutoSolverLangChainAgent:
             "reference": trim(ctx.reference) if ctx.reference else None,
             "evaluated_candidates": len(ctx.history),
             "iterations": ctx.iteration,
-            "controller": "llm" if (self.use_llm and maybe_build_llm() is not None) else "heuristic",
+            "controller": ctx.controller_mode,
+            "task_analysis": ctx.task_analysis,
+            "strategy_plan": ctx.strategy_plan[-20:],
+            "round_reviews": ctx.round_reviews[-20:],
+            "final_reason": ctx.final_reason,
+            "notes": ctx.notes[-30:],
         }
 
 
