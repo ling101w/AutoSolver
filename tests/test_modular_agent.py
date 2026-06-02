@@ -10,6 +10,7 @@ from autosolver_agent import AutoSolverLangChainAgent
 from autosolver_agent.caseio import parse_case, score_answer
 from autosolver_agent.llm.schema import parse_candidate_envelope
 from autosolver_agent.memory import MemoryStore
+from autosolver_agent.memory.store import MEMORY_SCHEMA_VERSION
 from autosolver_agent.models import Candidate, Case, ScoreResult
 from autosolver_agent.tools import InstanceClassifier, Validator
 from langchain_autosolver_agent import build_parser
@@ -114,6 +115,72 @@ class ModularAgentTests(unittest.TestCase):
             store.save(os.path.join(tmp, "short.json"))
             self.assertTrue(os.path.exists(os.path.join(tmp, "long_term_memory.json")))
             self.assertTrue(os.path.exists(os.path.join(tmp, "short.json")))
+
+    def test_memory_migrates_and_trims_long_term_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            long_term_path = os.path.join(tmp, "long_term_memory.json")
+            legacy = {
+                "created_at": "legacy",
+                "strategy_history": [{"name": f"s{i}"} for i in range(4)],
+                "feature_strategy_effects": [{"name": f"f{i}"} for i in range(4)],
+                "experiments": [
+                    {
+                        "candidate": f"c{i}",
+                        "features": {},
+                        "tags": [],
+                        "strategy": ["expected_greedy"],
+                        "params": {},
+                        "score": None,
+                        "reward": float(i),
+                    }
+                    for i in range(4)
+                ],
+            }
+            with open(long_term_path, "w", encoding="utf-8") as handle:
+                json.dump(legacy, handle)
+
+            store = MemoryStore(tmp, max_long_term_items=2)
+            self.assertEqual(store.long_term["schema_version"], MEMORY_SCHEMA_VERSION)
+            self.assertEqual(store.long_term["metadata"]["retention"]["max_items_per_list"], 2)
+            self.assertEqual([item["candidate"] for item in store.long_term["experiments"]], ["c2", "c3"])
+            self.assertEqual(len(store.long_term["strategy_history"]), 2)
+
+            store.save()
+            with open(long_term_path, "r", encoding="utf-8") as handle:
+                saved = json.load(handle)
+            self.assertEqual(saved["schema_version"], MEMORY_SCHEMA_VERSION)
+            self.assertEqual(len(saved["experiments"]), 2)
+            self.assertEqual(saved["bandit_arms"]["expected_greedy"]["count"], 4)
+
+    def test_memory_save_merges_latest_long_term_records_under_lock(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            first = MemoryStore(tmp, max_long_term_items=10)
+            second = MemoryStore(tmp, max_long_term_items=10)
+
+            first.record_experiment(
+                iteration=1,
+                candidate_name="first",
+                features={},
+                strategy=["expected_greedy"],
+                params={},
+            )
+            first.save()
+
+            second.record_experiment(
+                iteration=2,
+                candidate_name="second",
+                features={},
+                strategy=["bundle_first"],
+                params={},
+            )
+            second.save()
+
+            loaded = MemoryStore(tmp, max_long_term_items=10)
+            candidates = {record["candidate"] for record in loaded.long_term["experiments"]}
+            self.assertTrue({"first", "second"}.issubset(candidates))
+            self.assertEqual(loaded.long_term["bandit_arms"]["expected_greedy"]["count"], 1)
+            self.assertEqual(loaded.long_term["bandit_arms"]["bundle_first"]["count"], 1)
+            self.assertTrue(os.path.exists(os.path.join(tmp, "long_term_memory.json.lock")))
 
     def test_structured_candidate_schema(self):
         envelope = parse_candidate_envelope(structured_candidate("schema_solver"))

@@ -1,4 +1,5 @@
 AutoSolver：让 AI Agent 自主求解配送分配问题
+
 任务背景：在外卖配送系统中，高效地将配送任务分配给骑手对于运营成功至关重 要。本题描述了一个真实场景：配送平台需要将多个配送订单分配给可用骑手，同时需综合考虑配送时间、距离、骑手意愿，以及合单配送（将多个订单合并给同一骑手）的可能性。同时系统允许拒绝订单，并且对骑手接起对应订单的概率有预测；系统允许一个订单同时指派给多位骑手，最先接起订单的骑手获得订单。系统需要在多个目标之间取得平衡：最大化接单订单数量、最大化系统收益（以分数表示），并通过智能合单来优化资源利用率。
 任务描述：给定一组配送订单（任务）和可用骑手，以及每个任务-骑手组合的预计算分数，求一个最优分配方案，使接单订单数量最大化，同时总分数最小化。
 交付目标：选手需要构建一个 AutoSolver Agent 系统，该系统具备以下能力：
@@ -31,3 +32,209 @@ workflow：
     7.迭代次数加一：
         如果达到迭代改进次数限制，结束流程并输出全局最优解
         分析本次修改的结果，产出一份修改对结果的影响，将影响带回到第3步以分析原因并继续改进
+
+一、任务背景
+
+在外卖配送系统中，平台需要把多个配送订单分配给可用骑手。每个订单或合单订单可以对应多个候选骑手，系统已提前给出该“任务组-骑手”组合的 total_score 和骑手接单概率 willingness。实际分配时，平台可以把一个任务组指派给一名或多名骑手，由最先接起的骑手获得订单；也可以不覆盖部分订单，但未覆盖订单会产生惩罚。
+
+本项目的目标不是手写一个固定启发式算法，而是构建一个 AutoSolver Agent：它读取配送分配 case 后，自主分析实例特征，规划候选策略，让 LLM 生成完整 Python 求解器，自动验证和评分，再基于历史实验记忆继续迭代，最终输出当前最优的 solve(input_text: str) -> list。
+
+二、输入与输出
+
+输入文件为 TSV 格式，首行包含：
+
+task_id_list    courier_id    total_score    willingness
+
+其中 task_id_list 可以是单任务，例如 t0，也可以是合单任务组，例如 t0,t1。每一行表示某个骑手可以接该任务组，并给出对应分数和接单概率。
+
+最终生成的求解器必须定义：
+
+def solve(input_text: str) -> list
+
+返回值示例：
+
+[("t0,t1", ["c2"]), ("t2", ["c0", "c3"])]
+
+输出必须满足：
+
+1. 每个任务最多出现一次。
+2. 每个骑手在全局最多使用一次。
+3. 输出的任务组必须存在于输入。
+4. 输出的骑手必须对该任务组有合法输入行。
+5. 每个输出任务组至少包含一名骑手。
+6. 返回 Python list，而不是 JSON 字符串或写文件结果。
+
+三、优化目标与评分逻辑
+
+候选求解器按如下顺序排序：
+
+1. 失败 case 数越少越好。
+2. 覆盖任务数越多越好。
+3. 总 penalty 越低越好。
+4. 总运行时间越短越好。
+
+单个任务组被分配给多个骑手时，系统按照接单概率计算期望 penalty：
+
+reject_prob = Π(1 - willingness_i)
+weighted_score = Σ(willingness_i * score_i) / Σ(willingness_i)
+group_penalty = reject_prob * 100 * task_count + (1 - reject_prob) * weighted_score
+
+未覆盖的任务按每个任务 100 额外加罚。代码中的候选排序 rank 为：
+
+(failures, -total_covered, total_penalty, total_runtime)
+
+四、已实现的 Agent 架构
+
+1. CLI 入口
+
+langchain_autosolver_agent.py 提供命令行入口，支持指定 case、迭代次数、运行预算、单 case 超时、记忆目录、artifact 目录、最终 solver 输出路径、摘要报告路径、修复次数、相似记忆检索数量和 UCB 探索系数。
+
+2. 顶层 Agent
+
+autosolver_agent/agent.py 中的 AutoSolverLangChainAgent 负责装配 case 加载器、MemoryStore、ArtifactStore、LLMCodeGenerator 和 AutoSolverWorkflow。运行完成后会输出最终 solver，并写出完整 report JSON。
+
+3. Workflow
+
+autosolver_agent/workflow/graph.py 实现 LangGraph 工作流：
+
+classify -> generate -> validate_and_score -> finalize
+
+如果 langgraph 不可用，会执行等价的顺序工作流。工作流内部维护当前最优候选、评分结果、验证错误、修复历史、规划 trace、工具调用、记忆检索、bandit 推荐、实验记录和影响分析。
+
+4. 实例分类器
+
+autosolver_agent/tools/classifier.py 根据 case 提取以下特征：
+
+row_count、task_count、courier_count、pair_ratio、avg_willingness、avg_score、high_willingness_ratio、capacity_ratio、low_capacity 等。
+
+分类器会进一步生成标签，例如 small_task_count、large_task_count、scarce_couriers、many_couriers、high_pair_ratio、low_pair_ratio、low_willingness、high_willingness，并给出 recommended_focus，用于指导策略选择。
+
+5. 策略库与求解器技能库
+
+autosolver_agent/skills/library.py 内置了提示级策略知识：
+
+- expected_greedy：按期望 penalty 做贪心分配。
+- bundle_first：合单比例高或骑手紧缺时优先考虑多任务组。
+- willingness_weighted：接单概率低时强化 willingness 权重，并尝试增加备用骑手。
+- flow_single_initial：骑手相对充足且合单比例低时，用单任务最小成本匹配作为初始解。
+- beam_cover：小规模或合单密集场景下用 beam search 覆盖任务。
+- local_search_repair：对已有可行解做移动、交换、破坏和修复。
+
+SolverSkillLibrary 约束 LLM 生成一个只依赖标准库的完整 Python 文件，并强调任务/骑手去重、合法任务组和内部超时控制。
+
+6. LangChain planner tools
+
+autosolver_agent/tools/langchain_tools.py 向规划 LLM 暴露只读工具：
+
+- get_instance_features：查看聚合和单 case 特征。
+- get_strategy_library：查看策略库上下文。
+- retrieve_similar_experiments：检索相似历史实验。
+- get_bandit_recommendations：获取 UCB explore/exploit 推荐。
+- get_best_artifact_summary：查看当前最优候选摘要。
+
+若当前 LLM 支持 bind_tools，规划阶段会真实调用这些工具；否则会使用基于特征和记忆的 fallback plan。
+
+7. LLM 结构化生成与修复
+
+autosolver_agent/llm/generator.py 实现三类 LLM 调用：
+
+- plan：生成 SolverPlan。
+- generate_from_plan：根据计划生成 CandidateEnvelope。
+- repair：在 schema 解析失败或验证失败后生成修复候选。
+
+autosolver_agent/llm/schema.py 使用 Pydantic 定义 SolverPlan、CandidateRationale 和 CandidateEnvelope，并兼容旧式 markdown 代码块输出。
+
+8. 验证器
+
+autosolver_agent/tools/validator.py 先做 AST 静态检查，再在子进程中 smoke run。验证内容包括：
+
+- 是否存在顶层 solve 函数。
+- Python 语法和 compile 是否通过。
+- 是否存在禁用 import 或禁用调用。
+- 在样例 case 上是否能按时返回。
+- 返回结果是否满足任务和骑手合法性约束。
+
+9. 评分器
+
+autosolver_agent/tools/scorer.py 在每个 case 上调用候选 solver，使用 autosolver_agent/caseio.py 中的 score_answer 计算覆盖、penalty、运行时间和失败数，并产出 ScoreResult 与 convergence 信息。
+
+10. 运行隔离
+
+autosolver_agent/runtime.py 使用 multiprocessing 在子进程执行候选 solver，并通过 timeout 终止超时进程，避免候选代码卡住主流程。
+
+11. 记忆系统
+
+autosolver_agent/memory/store.py 维护：
+
+- short_term：当前 run 的候选、验证、评分、错误和影响分析。
+- long_term_memory.json：跨 run 的实验记录、策略历史、特征-策略效果和 bandit arms。
+- retrieve_similar：基于实例特征距离和标签重叠检索相似实验。
+- bandit_recommendations：使用 UCB 推荐探索或利用哪些策略组合。
+
+12. Artifact 系统
+
+autosolver_agent/artifacts.py 将每轮迭代产物保存到 artifact 目录，包括候选代码、rationale、validation、score 和 impact。finalize 阶段会对 top-k 候选用正式 per-case timeout 复评，并写出最终 solver。
+
+五、端到端流程
+
+1. 读取命令行参数和 case 文件。
+2. 解析 TSV，提取任务、骑手、合单行和概率/分数数据。
+3. 分类实例特征，生成 tags 和 recommended_focus。
+4. 构造策略库、求解器技能库、历史记忆、相似实验和 bandit 推荐。
+5. 规划 LLM 通过工具或 fallback 生成 SolverPlan。
+6. 代码 LLM 生成 CandidateEnvelope，其中包含 rationale 和完整 Python solver。
+7. 保存候选代码和 rationale。
+8. 静态验证和 runtime smoke test。
+9. 若 schema 或验证失败，调用 repair 并记录 repair_history。
+10. 对验证通过的候选执行评分。
+11. 保存 score、impact 和实验记录，更新短期/长期记忆与 bandit 统计。
+12. 达到迭代上限或预算耗尽后，选取 top-k 候选复评。
+13. 写出最终 solver、完整 report、可选 summary 和 memory 文件。
+
+六、运行方式
+
+安装依赖：
+
+.venv/bin/python -m pip install -r requirements.txt
+
+配置真实 LLM：
+
+export OPENAI_API_KEY=sk-...
+export AUTOSOLVER_LLM_MODEL=gpt-4o-mini
+
+运行 demo：
+
+.venv/bin/python langchain_autosolver_agent.py \
+  --cases examples/demo_case.txt \
+  --iterations 3 \
+  --budget 60 \
+  --per-case-timeout 5 \
+  --search-per-case-timeout 2 \
+  --memory-dir runs/autosolver_memory \
+  --artifact-dir runs/autosolver_artifacts \
+  --summary-out runs/autosolver_summary.json \
+  --out runs/generated_submit_solution.py
+
+七、主要输出文件
+
+- runs/generated_submit_solution.py：最终 solver。
+- runs/generated_submit_solution.py.report.json：完整运行报告。
+- runs/autosolver_summary.json：摘要报告。
+- runs/autosolver_memory/long_term_memory.json：长期记忆。
+- runs/autosolver_memory/short_term_last_run.json：最近一次短期记忆。
+- runs/autosolver_artifacts/iteration_*/：每轮候选代码、rationale、validation、score 和 impact。
+
+八、测试与验收
+
+运行单元测试：
+
+.venv/bin/python -m unittest discover -s tests -v
+
+测试使用 fake LLM，不依赖网络。当前测试覆盖 case 解析、分类、评分、静态验证、非法输出验证、结构化 schema、记忆保存、相似实验检索、UCB 推荐、Agent 端到端运行、schema 修复、验证修复和 CLI 参数解析。
+
+九、当前边界
+
+1. 真实运行需要 OpenAI 兼容 LLM API key；未配置 key 时系统会明确失败，不会静默退化为手写 heuristic。
+2. 生成 solver 被限制为纯函数式标准库代码，不能访问文件、网络、子进程或动态执行能力。
+3. 策略库目前是 Agent 的规划提示知识，最终具体算法由 LLM 根据当前 case、历史记忆和验证反馈生成。
+4. runs 目录下的 memory 和 artifacts 是实验状态，可以复用来帮助后续迭代，但不应作为源码提交的核心逻辑。

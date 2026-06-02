@@ -11,10 +11,21 @@ from typing import Any, Dict, List, Optional, Sequence
 from autosolver_agent.models import ScoreResult, ValidationResult
 
 
+MEMORY_SCHEMA_VERSION = 2
+DEFAULT_MAX_LONG_TERM_ITEMS = 1000
+_CAPPED_LONG_TERM_KEYS = ("strategy_history", "feature_strategy_effects", "experiments")
+
+
 class MemoryStore:
-    def __init__(self, memory_dir: str) -> None:
+    def __init__(self, memory_dir: str, max_long_term_items: Optional[int] = None) -> None:
         self.memory_dir = os.path.abspath(memory_dir)
         self.long_term_path = os.path.join(self.memory_dir, "long_term_memory.json")
+        self.lock_path = self.long_term_path + ".lock"
+        self.max_long_term_items = _positive_int(
+            max_long_term_items,
+            env_name="AUTOSOLVER_MEMORY_MAX_ITEMS",
+            default=DEFAULT_MAX_LONG_TERM_ITEMS,
+        )
         self.short_term: Dict[str, Any] = {
             "run_started_at": _now(),
             "iterations": [],
@@ -24,13 +35,20 @@ class MemoryStore:
         }
         os.makedirs(self.memory_dir, exist_ok=True)
         self.long_term = self._load_long_term()
+        self._loaded_counts = self._list_counts(self.long_term)
 
     def _load_long_term(self) -> Dict[str, Any]:
+        with _FileLock(self.lock_path):
+            value = self._read_long_term_unlocked()
+        if isinstance(value, dict):
+            return self._ensure_schema(value)
+        return self._new_long_term()
+
+    def _read_long_term_unlocked(self) -> Optional[Dict[str, Any]]:
         try:
             with open(self.long_term_path, "r", encoding="utf-8") as handle:
                 value = json.load(handle)
             if isinstance(value, dict):
-                self._ensure_schema(value)
                 return value
         except FileNotFoundError:
             pass
@@ -40,23 +58,56 @@ class MemoryStore:
                 os.replace(self.long_term_path, corrupt_path)
             except Exception:
                 pass
+        return None
+
+    def _new_long_term(self) -> Dict[str, Any]:
         value = {
+            "schema_version": MEMORY_SCHEMA_VERSION,
             "created_at": _now(),
             "updated_at": _now(),
             "strategy_history": [],
             "feature_strategy_effects": [],
             "experiments": [],
             "bandit_arms": {},
+            "metadata": {"retention": {"max_items_per_list": self.max_long_term_items}},
         }
-        self._ensure_schema(value)
-        return value
+        return self._ensure_schema(value)
 
-    def _ensure_schema(self, value: Dict[str, Any]) -> None:
-        value.setdefault("strategy_history", [])
-        value.setdefault("feature_strategy_effects", [])
-        value.setdefault("experiments", [])
-        value.setdefault("bandit_arms", {})
+    def _ensure_schema(self, value: Dict[str, Any]) -> Dict[str, Any]:
+        previous_version = _schema_version(value)
+        value.setdefault("created_at", _now())
         value.setdefault("updated_at", _now())
+        value["schema_version"] = MEMORY_SCHEMA_VERSION
+        for key in _CAPPED_LONG_TERM_KEYS:
+            if not isinstance(value.get(key), list):
+                value[key] = []
+            else:
+                value[key] = _as_list(value[key])
+        if not isinstance(value.get("bandit_arms"), dict):
+            value["bandit_arms"] = {}
+        if not value["bandit_arms"] and value.get("experiments"):
+            value["bandit_arms"] = _build_bandit_arms(value.get("experiments", []))
+        metadata = value.get("metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+        retention = metadata.get("retention")
+        if not isinstance(retention, dict):
+            retention = {}
+        retention["max_items_per_list"] = self.max_long_term_items
+        metadata["retention"] = retention
+        if previous_version != MEMORY_SCHEMA_VERSION:
+            migrations = metadata.setdefault("migrations", [])
+            if isinstance(migrations, list):
+                migrations.append(
+                    {
+                        "from_schema_version": previous_version,
+                        "to_schema_version": MEMORY_SCHEMA_VERSION,
+                        "migrated_at": _now(),
+                    }
+                )
+        value["metadata"] = metadata
+        self._trim_long_term(value)
+        return value
 
     def digest(
         self,
@@ -254,24 +305,151 @@ class MemoryStore:
         }
 
     def save(self, short_term_path: Optional[str] = None) -> None:
-        self.long_term["updated_at"] = _now()
-        _write_json_atomic(self.long_term_path, self.long_term)
-        if short_term_path:
-            _write_json_atomic(short_term_path, self.short_term)
+        with _FileLock(self.lock_path):
+            latest = self._read_long_term_unlocked()
+            if isinstance(latest, dict):
+                latest = self._ensure_schema(latest)
+            else:
+                latest = self._new_long_term()
+            merged = self._merge_long_term(latest)
+            merged["updated_at"] = _now()
+            self._trim_long_term(merged)
+            _write_json_atomic(self.long_term_path, merged)
+            if short_term_path:
+                _write_json_atomic(short_term_path, self.short_term)
+        self.long_term = merged
+        self._loaded_counts = self._list_counts(self.long_term)
+
+    def _merge_long_term(self, latest: Dict[str, Any]) -> Dict[str, Any]:
+        merged = dict(latest)
+        appended: Dict[str, List[Dict[str, Any]]] = {}
+        for key in _CAPPED_LONG_TERM_KEYS:
+            current_items = _as_list(self.long_term.get(key))
+            offset = min(self._loaded_counts.get(key, 0), len(current_items))
+            delta = current_items[offset:]
+            appended[key] = delta
+            merged[key] = _as_list(merged.get(key)) + delta
+        arms = dict(merged.get("bandit_arms", {}))
+        for record in appended.get("experiments", []):
+            _apply_bandit_record(arms, record)
+        merged["bandit_arms"] = arms
+        metadata = dict(merged.get("metadata", {}))
+        metadata["retention"] = {"max_items_per_list": self.max_long_term_items}
+        merged["metadata"] = metadata
+        merged["schema_version"] = MEMORY_SCHEMA_VERSION
+        return merged
+
+    def _trim_long_term(self, value: Dict[str, Any]) -> None:
+        for key in _CAPPED_LONG_TERM_KEYS:
+            items = value.get(key)
+            if isinstance(items, list) and len(items) > self.max_long_term_items:
+                value[key] = items[-self.max_long_term_items :]
+
+    def _list_counts(self, value: Dict[str, Any]) -> Dict[str, int]:
+        return {key: len(_as_list(value.get(key))) for key in _CAPPED_LONG_TERM_KEYS}
 
     def _update_bandit(self, record: Dict[str, Any]) -> None:
-        arm = _arm_key(record.get("strategy", []))
         arms = self.long_term.setdefault("bandit_arms", {})
-        stats = arms.setdefault(arm, {"count": 0, "total_reward": 0.0, "mean_reward": 0.0, "failures": 0})
-        stats["count"] = int(stats.get("count", 0)) + 1
-        stats["total_reward"] = float(stats.get("total_reward", 0.0)) + float(record.get("reward", 0.0))
-        stats["mean_reward"] = stats["total_reward"] / max(1, stats["count"])
-        if record.get("failure_reason"):
-            stats["failures"] = int(stats.get("failures", 0)) + 1
+        _apply_bandit_record(arms, record)
+
+
+class _FileLock:
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self._handle = None
+
+    def __enter__(self) -> "_FileLock":
+        os.makedirs(os.path.dirname(os.path.abspath(self.path)), exist_ok=True)
+        self._handle = open(self.path, "a+", encoding="utf-8")
+        self._handle.seek(0)
+        if not self._handle.read(1):
+            self._handle.write("0")
+            self._handle.flush()
+        self._lock()
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        try:
+            self._unlock()
+        finally:
+            if self._handle is not None:
+                self._handle.close()
+                self._handle = None
+
+    def _lock(self) -> None:
+        if self._handle is None:
+            return
+        self._handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(self._handle.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(self._handle.fileno(), fcntl.LOCK_EX)
+
+    def _unlock(self) -> None:
+        if self._handle is None:
+            return
+        self._handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(self._handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _positive_int(value: Optional[int], env_name: str, default: int) -> int:
+    if value is None:
+        raw = os.environ.get(env_name)
+        if raw:
+            try:
+                value = int(raw)
+            except ValueError:
+                value = None
+    try:
+        parsed = int(value if value is not None else default)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(1, parsed)
+
+
+def _schema_version(value: Dict[str, Any]) -> int:
+    try:
+        return int(value.get("schema_version", 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _as_list(value: Any) -> List[Dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, dict)]
+
+
+def _build_bandit_arms(records: Sequence[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    arms: Dict[str, Dict[str, Any]] = {}
+    for record in records:
+        _apply_bandit_record(arms, record)
+    return arms
+
+
+def _apply_bandit_record(arms: Dict[str, Dict[str, Any]], record: Dict[str, Any]) -> None:
+    arm = _arm_key(record.get("strategy", []))
+    stats = arms.setdefault(arm, {"count": 0, "total_reward": 0.0, "mean_reward": 0.0, "failures": 0})
+    stats["count"] = int(stats.get("count", 0)) + 1
+    stats["total_reward"] = float(stats.get("total_reward", 0.0)) + float(record.get("reward", 0.0))
+    stats["mean_reward"] = stats["total_reward"] / max(1, stats["count"])
+    if record.get("failure_reason"):
+        stats["failures"] = int(stats.get("failures", 0)) + 1
 
 
 def _write_json_atomic(path: str, value: Dict[str, Any]) -> None:
