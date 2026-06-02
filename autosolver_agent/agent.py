@@ -31,6 +31,10 @@ class AutoSolverLangChainAgent:
         max_cases: int = 3,
         verbose: bool = True,
         finalize_top_k: int = 3,
+        max_repair_attempts: int = 2,
+        memory_top_k: int = 5,
+        bandit_exploration: float = 1.4,
+        summary_output_path: Optional[str] = None,
     ) -> None:
         self.case_paths = case_paths or []
         self.output_path = output_path
@@ -46,6 +50,10 @@ class AutoSolverLangChainAgent:
         self.max_cases = max_cases
         self.verbose = verbose
         self.finalize_top_k = finalize_top_k
+        self.max_repair_attempts = max_repair_attempts
+        self.memory_top_k = memory_top_k
+        self.bandit_exploration = bandit_exploration
+        self.summary_output_path = summary_output_path
 
     def run(self) -> Dict[str, Any]:
         paths = self.case_paths or discover_case_paths(os.getcwd())
@@ -71,6 +79,10 @@ class AutoSolverLangChainAgent:
             llm=llm,
             verbose=self.verbose,
             finalize_top_k=self.finalize_top_k,
+            max_repair_attempts=self.max_repair_attempts,
+            memory_top_k=self.memory_top_k,
+            bandit_exploration=self.bandit_exploration,
+            summary_output_path=self.summary_output_path,
         )
         report = workflow.run()
         report_path = self.output_path + ".report.json"

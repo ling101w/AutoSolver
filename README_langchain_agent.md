@@ -1,25 +1,43 @@
-# Modular LangChain AutoSolver Agent
+# AutoSolver Agent
 
-This repository now uses a modular Agent architecture for the delivery assignment AutoSolver.
+AutoSolver Agent is a LangGraph/LangChain-based solver-generation agent for delivery assignment optimization. It classifies an input case, plans with tool-accessible context, asks an LLM to produce a complete `solve(input_text: str) -> list` solver, validates the solver, scores it, records experiment memory, and iterates toward the best candidate.
 
 ## Architecture
 
-- `autosolver_agent/skills`: strategy and solver skill libraries. These describe how a strategy works, which instance features it fits, and what implementation constraints the LLM-generated solver must follow.
-- `autosolver_agent/tools`: Agent tools for instance classification, static/runtime validation, and scoring.
-- `autosolver_agent/memory`: JSON-backed short-term and long-term repository memory.
-- `autosolver_agent/llm`: full-solver LLM code generation. There is no heuristic or template fallback.
-- `autosolver_agent/workflow`: LangGraph workflow orchestration. If `langgraph` is installed, the graph runner is used.
-- `langchain_autosolver_agent.py`: the new CLI entrypoint.
+```mermaid
+flowchart LR
+  A["Case TSV"] --> B["Classifier"]
+  B --> C["Planner tools"]
+  C --> D["Tool-aware LLM plan"]
+  D --> E["Structured JSON solver generation"]
+  E --> F["AST + subprocess validation"]
+  F -->|invalid| G["Repair loop"]
+  G --> F
+  F -->|valid| H["Scorer"]
+  H --> I["Experiment memory"]
+  I --> J["Similarity retrieval + UCB bandit"]
+  J --> D
+  H --> K["Best solver + report summary"]
+```
+
+## What This Shows
+
+- **Agent orchestration:** LangGraph workflow with classify, plan, generate, validate, repair, score, and finalize phases.
+- **Tool use:** planning tools expose instance features, strategy guidance, similar experiments, bandit recommendations, and best artifact summaries to LangChain-compatible LLMs.
+- **Structured generation:** candidates use a Pydantic-validated JSON envelope containing rationale and full Python code.
+- **Self-repair:** malformed schema output and validation failures are repaired without consuming the main iteration count.
+- **Learning memory:** long-term experiment records store features, strategies, parameters, scores, failure reasons, and UCB bandit statistics.
+- **Auditability:** per-iteration code, rationale, validation, score, impact, planner trace, repair history, and report summary are persisted.
 
 ## Install
 
+Use the project virtual environment:
+
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+.venv/bin/python -m pip install -r requirements.txt
 ```
 
-Set an OpenAI-compatible key before running:
+Set an OpenAI-compatible key for real LLM runs:
 
 ```bash
 export OPENAI_API_KEY=sk-...
@@ -32,45 +50,51 @@ Optional compatible endpoint:
 export OPENAI_BASE_URL=https://api.example.com/v1
 ```
 
-## Run
+## Demo Run
 
 ```bash
-python3 langchain_autosolver_agent.py \
-  --cases large_seed301.txt \
+.venv/bin/python langchain_autosolver_agent.py \
+  --cases examples/demo_case.txt \
   --iterations 3 \
-  --budget 90 \
-  --per-case-timeout 10 \
-  --search-per-case-timeout 3 \
+  --budget 60 \
+  --per-case-timeout 5 \
+  --search-per-case-timeout 2 \
   --memory-dir runs/autosolver_memory \
   --artifact-dir runs/autosolver_artifacts \
-  --out generated_submit_solution.py
+  --summary-out runs/autosolver_summary.json \
+  --out runs/generated_submit_solution.py
 ```
 
-The Agent writes:
+The agent writes:
 
-- final solver: `generated_submit_solution.py`
-- report: `generated_submit_solution.py.report.json`
+- final solver: `runs/generated_submit_solution.py`
+- full report: `runs/generated_submit_solution.py.report.json`
+- summary report: `runs/autosolver_summary.json`
 - long-term memory: `runs/autosolver_memory/long_term_memory.json`
 - last short-term memory: `runs/autosolver_memory/short_term_last_run.json`
-- per-iteration code, rationale, validation, score, and impact files under `runs/autosolver_artifacts/`
+- per-iteration artifacts under `runs/autosolver_artifacts/`
 
-If no LLM key/client is configured, the CLI fails immediately. This is intentional.
+## Report Summary Example
 
-## Workflow
-
-1. Load case files and classify instance features such as task count, courier count, pair ratio, willingness, and capacity pressure.
-2. Select strategy guidance from the strategy library and combine it with solver-skill constraints.
-3. Read short-term and long-term memory plus previous disk results.
-4. Ask the LLM to generate a complete standard-library `solve(input_text: str) -> list` solver and JSON rationale.
-5. Run AST/compile validation, then smoke-run validation in a subprocess.
-6. Score legal candidates with `rank=(failures, -covered, total_penalty, total_runtime)`.
-7. Persist code, rationale, validation, score, impact analysis, and memory updates.
-8. After the configured iteration count or budget exhaustion, recheck Top-K candidates with the final timeout and write the global best solver.
+```json
+{
+  "best_candidate": "solver_v3",
+  "best_covered": 3,
+  "best_penalty": 72.5,
+  "candidates_generated": 5,
+  "repairs_attempted": 1,
+  "valid_scores": 3
+}
+```
 
 ## Test
 
 ```bash
-python -m unittest discover -s tests -v
+.venv/bin/python -m unittest discover -s tests -v
 ```
 
-The tests use a fake LLM so they do not require network access.
+The tests use fake LLM responses and do not require network access.
+
+## Resume Angle
+
+This project can be presented as an agent engineering system rather than a single heuristic script: it combines tool-aware planning, structured LLM generation, validation-driven repair, experiment memory, bandit-guided strategy selection, and auditable evaluation artifacts.

@@ -1,4 +1,4 @@
-"""CLI entrypoint for the modular LangChain AutoSolver Agent."""
+"""CLI entrypoint for the modular AutoSolver Agent."""
 
 from __future__ import annotations
 
@@ -27,6 +27,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--llm-base-url", default=None, help="OpenAI-compatible base URL.")
     parser.add_argument("--max-cases", type=int, default=3)
     parser.add_argument("--finalize-top-k", type=int, default=3)
+    parser.add_argument("--max-repair-attempts", type=int, default=2)
+    parser.add_argument("--memory-top-k", type=int, default=5)
+    parser.add_argument("--bandit-exploration", type=float, default=1.4)
+    parser.add_argument("--summary-out", default=None, help="Optional JSON summary output path.")
     parser.add_argument("--quiet", action="store_true")
     return parser
 
@@ -47,6 +51,10 @@ def main() -> None:
         max_cases=args.max_cases,
         verbose=not args.quiet,
         finalize_top_k=args.finalize_top_k,
+        max_repair_attempts=args.max_repair_attempts,
+        memory_top_k=args.memory_top_k,
+        bandit_exploration=args.bandit_exploration,
+        summary_output_path=args.summary_out,
     )
     report = agent.run()
     print(json.dumps(report, indent=2, ensure_ascii=False, sort_keys=True))

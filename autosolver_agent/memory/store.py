@@ -1,11 +1,12 @@
-"""Short-term and long-term JSON memory."""
+"""Short-term memory, long-term experiment memory, and bandit recommendations."""
 
 from __future__ import annotations
 
 import json
+import math
 import os
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 from autosolver_agent.models import ScoreResult, ValidationResult
 
@@ -19,6 +20,7 @@ class MemoryStore:
             "iterations": [],
             "errors": [],
             "impact_analysis": [],
+            "experiments": [],
         }
         os.makedirs(self.memory_dir, exist_ok=True)
         self.long_term = self._load_long_term()
@@ -28,9 +30,7 @@ class MemoryStore:
             with open(self.long_term_path, "r", encoding="utf-8") as handle:
                 value = json.load(handle)
             if isinstance(value, dict):
-                value.setdefault("strategy_history", [])
-                value.setdefault("feature_strategy_effects", [])
-                value.setdefault("updated_at", _now())
+                self._ensure_schema(value)
                 return value
         except FileNotFoundError:
             pass
@@ -40,19 +40,42 @@ class MemoryStore:
                 os.replace(self.long_term_path, corrupt_path)
             except Exception:
                 pass
-        return {
+        value = {
             "created_at": _now(),
             "updated_at": _now(),
             "strategy_history": [],
             "feature_strategy_effects": [],
+            "experiments": [],
+            "bandit_arms": {},
         }
+        self._ensure_schema(value)
+        return value
 
-    def digest(self, limit: int = 8) -> Dict[str, Any]:
+    def _ensure_schema(self, value: Dict[str, Any]) -> None:
+        value.setdefault("strategy_history", [])
+        value.setdefault("feature_strategy_effects", [])
+        value.setdefault("experiments", [])
+        value.setdefault("bandit_arms", {})
+        value.setdefault("updated_at", _now())
+
+    def digest(
+        self,
+        limit: int = 8,
+        features: Optional[Dict[str, Any]] = None,
+        top_k: int = 5,
+        exploration: float = 1.4,
+    ) -> Dict[str, Any]:
+        candidate_arms = []
+        if features:
+            candidate_arms = list(features.get("recommended_focus", []) or features.get("tags", []))
         return {
             "strategy_history": self.long_term.get("strategy_history", [])[-limit:],
             "feature_strategy_effects": self.long_term.get("feature_strategy_effects", [])[-limit:],
             "short_term_recent": self.short_term.get("iterations", [])[-limit:],
             "recent_errors": self.short_term.get("errors", [])[-limit:],
+            "similar_experiments": self.retrieve_similar(features or {}, top_k=top_k) if features else [],
+            "bandit_recommendations": self.bandit_recommendations(candidate_arms, exploration=exploration, limit=top_k),
+            "best_experiment": self.best_experiment_summary(),
         }
 
     def record_candidate(
@@ -110,11 +133,141 @@ class MemoryStore:
             }
         )
 
+    def record_experiment(
+        self,
+        iteration: int,
+        candidate_name: str,
+        features: Dict[str, Any],
+        strategy: Sequence[str],
+        params: Dict[str, Any],
+        score: Optional[ScoreResult] = None,
+        validation: Optional[ValidationResult] = None,
+        artifact_paths: Optional[Dict[str, Any]] = None,
+        failure_reason: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        reward = _reward(score, validation, failure_reason)
+        record = {
+            "id": f"{_now()}::{iteration}::{candidate_name}",
+            "created_at": _now(),
+            "iteration": iteration,
+            "candidate": candidate_name,
+            "features": _compact_features(features),
+            "tags": list(features.get("tags", [])),
+            "strategy": list(strategy) or ["unknown"],
+            "params": params,
+            "score": _score_summary(score),
+            "validation": _validation_summary(validation),
+            "failure_reason": failure_reason,
+            "artifact_paths": artifact_paths or {},
+            "reward": reward,
+        }
+        self.short_term["experiments"].append(record)
+        self.long_term["experiments"].append(record)
+        self._update_bandit(record)
+        return record
+
+    def retrieve_similar(self, features: Dict[str, Any], top_k: int = 5) -> List[Dict[str, Any]]:
+        if not features:
+            return []
+        target = _compact_features(features)
+        target_tags = set(features.get("tags", []))
+        items = []
+        for record in self.long_term.get("experiments", []):
+            distance = _feature_distance(target, record.get("features", {}))
+            tags = set(record.get("tags", []))
+            if target_tags or tags:
+                overlap = len(target_tags & tags)
+                union = len(target_tags | tags) or 1
+                distance += 1.0 - overlap / union
+            item = {
+                "distance": round(distance, 6),
+                "candidate": record.get("candidate"),
+                "strategy": record.get("strategy", []),
+                "params": record.get("params", {}),
+                "score": record.get("score"),
+                "failure_reason": record.get("failure_reason"),
+                "reward": record.get("reward"),
+                "artifact_paths": record.get("artifact_paths", {}),
+            }
+            items.append(item)
+        items.sort(key=lambda item: (item["distance"], -(item.get("reward") or -1e18)))
+        return items[: max(0, top_k)]
+
+    def bandit_recommendations(
+        self,
+        candidate_arms: Optional[Sequence[str]] = None,
+        exploration: float = 1.4,
+        limit: int = 5,
+    ) -> List[Dict[str, Any]]:
+        arms = dict(self.long_term.get("bandit_arms", {}))
+        for arm in candidate_arms or []:
+            key = _arm_key([str(arm)])
+            arms.setdefault(key, {"count": 0, "total_reward": 0.0, "mean_reward": 0.0, "failures": 0})
+        total = sum(int(item.get("count", 0)) for item in arms.values()) + 1
+        recommendations = []
+        for arm, stats in arms.items():
+            count = int(stats.get("count", 0))
+            mean = float(stats.get("mean_reward", 0.0))
+            if count == 0:
+                ucb = float("inf")
+                mode = "explore_cold_start"
+            else:
+                ucb = mean + exploration * math.sqrt(math.log(total + 1.0) / count)
+                mode = "exploit" if count >= 2 else "explore"
+            recommendations.append(
+                {
+                    "arm": arm,
+                    "count": count,
+                    "mean_reward": round(mean, 6),
+                    "ucb": "inf" if math.isinf(ucb) else round(ucb, 6),
+                    "mode": mode,
+                    "failures": int(stats.get("failures", 0)),
+                }
+            )
+        recommendations.sort(key=lambda item: (item["ucb"] == "inf", item["ucb"] if item["ucb"] != "inf" else 1e18), reverse=True)
+        return recommendations[: max(0, limit)]
+
+    def best_experiment_summary(self) -> Dict[str, Any]:
+        valid = [
+            record
+            for record in self.long_term.get("experiments", [])
+            if record.get("score") and record.get("score", {}).get("failures", 999) == 0
+        ]
+        if not valid:
+            return {}
+        valid.sort(
+            key=lambda record: (
+                record["score"].get("failures", 999),
+                -record["score"].get("covered", 0),
+                record["score"].get("penalty", 1e18),
+                record["score"].get("runtime", 1e18),
+            )
+        )
+        best = valid[0]
+        return {
+            "candidate": best.get("candidate"),
+            "strategy": best.get("strategy", []),
+            "params": best.get("params", {}),
+            "score": best.get("score"),
+            "artifact_paths": best.get("artifact_paths", {}),
+            "reward": best.get("reward"),
+        }
+
     def save(self, short_term_path: Optional[str] = None) -> None:
         self.long_term["updated_at"] = _now()
         _write_json_atomic(self.long_term_path, self.long_term)
         if short_term_path:
             _write_json_atomic(short_term_path, self.short_term)
+
+    def _update_bandit(self, record: Dict[str, Any]) -> None:
+        arm = _arm_key(record.get("strategy", []))
+        arms = self.long_term.setdefault("bandit_arms", {})
+        stats = arms.setdefault(arm, {"count": 0, "total_reward": 0.0, "mean_reward": 0.0, "failures": 0})
+        stats["count"] = int(stats.get("count", 0)) + 1
+        stats["total_reward"] = float(stats.get("total_reward", 0.0)) + float(record.get("reward", 0.0))
+        stats["mean_reward"] = stats["total_reward"] / max(1, stats["count"])
+        if record.get("failure_reason"):
+            stats["failures"] = int(stats.get("failures", 0)) + 1
 
 
 def _now() -> str:
@@ -127,3 +280,80 @@ def _write_json_atomic(path: str, value: Dict[str, Any]) -> None:
     with open(tmp, "w", encoding="utf-8") as handle:
         json.dump(value, handle, indent=2, ensure_ascii=False, sort_keys=True)
     os.replace(tmp, path)
+
+
+def _compact_features(features: Dict[str, Any]) -> Dict[str, Any]:
+    keys = [
+        "row_count",
+        "task_count",
+        "courier_count",
+        "pair_ratio",
+        "avg_willingness",
+        "avg_score",
+        "high_willingness_ratio",
+        "capacity_ratio",
+        "low_capacity",
+    ]
+    compact = {}
+    for key in keys:
+        if key in features:
+            value = features[key]
+            if isinstance(value, bool):
+                compact[key] = 1.0 if value else 0.0
+            elif isinstance(value, (int, float)):
+                compact[key] = float(value)
+    return compact
+
+
+def _feature_distance(left: Dict[str, Any], right: Dict[str, Any]) -> float:
+    keys = sorted(set(left) | set(right))
+    if not keys:
+        return 0.0
+    total = 0.0
+    for key in keys:
+        lv = float(left.get(key, 0.0) or 0.0)
+        rv = float(right.get(key, 0.0) or 0.0)
+        scale = max(1.0, abs(lv), abs(rv))
+        total += abs(lv - rv) / scale
+    return total / len(keys)
+
+
+def _score_summary(score: Optional[ScoreResult]) -> Optional[Dict[str, Any]]:
+    if score is None:
+        return None
+    return {
+        "name": score.name,
+        "rank": list(score.rank),
+        "covered": score.total_covered,
+        "tasks": score.total_tasks,
+        "penalty": round(score.total_penalty, 6),
+        "runtime": round(score.total_runtime, 6),
+        "failures": score.failures,
+        "convergence": score.convergence,
+    }
+
+
+def _validation_summary(validation: Optional[ValidationResult]) -> Optional[Dict[str, Any]]:
+    if validation is None:
+        return None
+    return {
+        "valid": validation.valid,
+        "stage": validation.stage,
+        "runtime": round(validation.runtime, 6),
+        "errors": validation.errors,
+    }
+
+
+def _reward(score: Optional[ScoreResult], validation: Optional[ValidationResult], failure_reason: Optional[str]) -> float:
+    if failure_reason or (validation is not None and not validation.valid):
+        return -1000.0
+    if score is None:
+        return -100.0
+    coverage_ratio = score.total_covered / max(1, score.total_tasks)
+    avg_penalty = score.total_penalty / max(1, score.total_tasks)
+    return round(coverage_ratio * 100.0 - avg_penalty - score.failures * 100.0 - score.total_runtime * 0.05, 6)
+
+
+def _arm_key(strategy: Sequence[str]) -> str:
+    values = [str(item) for item in strategy if str(item).strip()]
+    return "+".join(sorted(dict.fromkeys(values))) or "unknown"
