@@ -75,6 +75,7 @@ def solve(input_text: str) -> list:
         return []
 
     state = construct_task_first_greedy_solution(data)
+    repair_task_coverage(state)
     return format_solution(state)
 
 
@@ -593,6 +594,147 @@ def restore_state(target: State, source: State) -> None:
 def remove_group(state: State, group: int) -> None:
     for courier in list(state.assigned[group]):
         remove_courier(state, group, courier)
+
+
+def repair_task_coverage(state: State) -> bool:
+    if state.covered_count >= state.data.total_tasks:
+        return True
+
+    repaired = False
+    while state.covered_count < state.data.total_tasks:
+        missing_mask = state.data.task_full_mask & ~state.task_mask
+        move = best_direct_coverage_repair(state, missing_mask)
+        if move is None:
+            move = best_replacement_coverage_repair(state, missing_mask)
+        if move is None:
+            break
+        apply_coverage_repair(state, move)
+        repaired = True
+
+    if repaired:
+        allocate_remaining_couriers_by_gain(state)
+        polish_courier_assignment(state)
+    return state.covered_count >= state.data.total_tasks
+
+
+def best_direct_coverage_repair(state: State, missing_mask: int):
+    data = state.data
+    best_move = None
+    best_key = None
+
+    for group in range(len(data.group_names)):
+        group_mask = data.group_masks[group]
+        if group in state.active:
+            continue
+        if group_mask & state.task_mask:
+            continue
+        newly_covered = popcount(group_mask & missing_mask)
+        if newly_covered <= 0:
+            continue
+
+        option = best_repair_courier_option(state, group, ())
+        if option is None:
+            continue
+
+        delta, courier, trim_group = option
+        key = (-newly_covered, delta / newly_covered, data.group_names[group])
+        if best_key is None or key < best_key:
+            best_key = key
+            best_move = ("direct", group, courier, trim_group, ())
+
+    return best_move
+
+
+def best_replacement_coverage_repair(state: State, missing_mask: int):
+    data = state.data
+    best_move = None
+    best_key = None
+
+    for group in range(len(data.group_names)):
+        group_mask = data.group_masks[group]
+        if group in state.active:
+            continue
+        newly_covered = popcount(group_mask & missing_mask)
+        if newly_covered <= 0:
+            continue
+
+        conflicts = [
+            active_group
+            for active_group in state.active
+            if data.group_masks[active_group] & group_mask
+        ]
+        if not conflicts:
+            continue
+
+        removed_mask = 0
+        removed_penalty = 0.0
+        for conflict in conflicts:
+            removed_mask |= data.group_masks[conflict]
+            removed_penalty += state.group_penalty[conflict]
+
+        if removed_mask & ~group_mask:
+            continue
+
+        option = best_repair_courier_option(state, group, conflicts)
+        if option is None:
+            continue
+
+        delta, courier, trim_group = option
+        net_delta = delta - removed_penalty
+        key = (-newly_covered, net_delta, data.group_names[group])
+        if best_key is None or key < best_key:
+            best_key = key
+            best_move = ("replace", group, courier, trim_group, tuple(conflicts))
+
+    return best_move
+
+
+def best_repair_courier_option(state: State, group: int, freed_groups):
+    freed = set(freed_groups)
+    best_option = None
+    best_key = None
+
+    for cand in state.data.group_candidates[group]:
+        courier = cand.courier
+        owner = state.owner[courier]
+        add_penalty = cand.singleton_penalty
+
+        if owner == -1:
+            trim_group = -1
+            delta = add_penalty
+        elif owner in freed:
+            trim_group = -1
+            delta = add_penalty
+        elif len(state.assigned[owner]) > 1:
+            trim_group = owner
+            delta = (
+                add_penalty
+                + penalty_after_remove(state, owner, courier)
+                - state.group_penalty[owner]
+            )
+        else:
+            continue
+
+        key = (delta, cand.score, -cand.willingness, courier)
+        if best_key is None or key < best_key:
+            best_key = key
+            best_option = (delta, courier, trim_group)
+
+    return best_option
+
+
+def apply_coverage_repair(state: State, move) -> None:
+    _, group, courier, trim_group, conflicts = move
+
+    if trim_group != -1:
+        remove_courier(state, trim_group, courier)
+
+    for conflict in conflicts:
+        if conflict in state.active:
+            remove_group(state, conflict)
+
+    if state.owner[courier] == -1:
+        add_courier(state, group, courier)
 
 
 def polish_three_courier_cycles(state: State) -> int:
