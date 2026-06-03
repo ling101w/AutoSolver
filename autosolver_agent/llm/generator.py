@@ -159,6 +159,8 @@ class LLMCodeGenerator:
             "You are AutoSolver Agent's code generator. Generate one complete Python solver. "
             "The solver must use only Python standard library and define solve(input_text: str) -> list. "
             "Do not use file IO, network IO, subprocess, eval, exec, compile, or dynamic imports. "
+            "When solver_examples are provided, use them as reference architectures and adapt their patterns "
+            "to the current SolverPlan instead of copying every routine. "
             "Return exactly one JSON object matching this CandidateEnvelope schema:\n"
             + candidate_schema_text()
         )
@@ -215,7 +217,9 @@ class LLMCodeGenerator:
     ) -> Candidate:
         system = (
             "You repair AutoSolver candidate solvers. Return exactly one JSON object matching this "
-            "CandidateEnvelope schema:\n" + candidate_schema_text()
+            "CandidateEnvelope schema. Use solver_examples as reference architectures when fixing construction, "
+            "coverage repair, or local-search issues, while keeping the solver self-contained:\n"
+            + candidate_schema_text()
         )
         user = (
             "Repair attempt {attempt} for iteration {iteration}.\n\n"

@@ -12,8 +12,10 @@ from autosolver_agent.llm.schema import parse_candidate_envelope
 from autosolver_agent.memory import MemoryStore
 from autosolver_agent.memory.store import MEMORY_SCHEMA_VERSION
 from autosolver_agent.models import Candidate, Case, ScoreResult
+from autosolver_agent.skills import SolverSkillLibrary, StrategyLibrary
 from autosolver_agent.tools import InstanceClassifier, Validator
 from langchain_autosolver_agent import build_parser
+from solvers import seed_solvers
 
 
 CASE_TEXT = """task_id_list\tcourier_id\ttotal_score\twillingness
@@ -98,6 +100,41 @@ class ModularAgentTests(unittest.TestCase):
         scored = score_answer(parsed, [("t0,t1", ["c2"])])
         self.assertTrue(scored["valid"])
         self.assertEqual(scored["covered"], 2)
+
+    def test_strategy_and_solver_context_include_reference_examples(self):
+        strategy_payload = json.loads(
+            StrategyLibrary().as_prompt_context(
+                {
+                    "task_count": 2,
+                    "courier_count": 3,
+                    "pair_ratio": 0.25,
+                    "avg_willingness": 0.6,
+                    "capacity_ratio": 1.5,
+                }
+            )
+        )
+        strategy_by_name = {item["name"]: item for item in strategy_payload["strategies"]}
+        self.assertIn("basic_seed_solver_pack", strategy_by_name["bundle_first"]["reference_examples"])
+        self.assertIn("task_first_greedy_repair_reference", strategy_by_name["bundle_first"]["reference_examples"])
+
+        solver_payload = json.loads(SolverSkillLibrary().as_prompt_context())
+        example_by_name = {item["name"]: item for item in solver_payload["solver_examples"]}
+        self.assertEqual(example_by_name["basic_seed_solver_pack"]["source_file"], "solvers/seed_solvers.py")
+        self.assertEqual(example_by_name["task_first_greedy_repair_reference"]["source_file"], "solvers/solver.py")
+        self.assertEqual(example_by_name["multi_start_hybrid_reference"]["source_file"], "solvers/solver_70433_best_E1.py")
+        self.assertIn("init_min_cost_flow_single", example_by_name["multi_start_hybrid_reference"]["prompt_excerpt"])
+
+    def test_seed_solvers_are_directly_callable_and_valid(self):
+        parsed = parse_case(CASE_TEXT)
+        for name, solver in seed_solvers.SEED_SOLVERS.items():
+            with self.subTest(strategy=name):
+                answer = solver(CASE_TEXT)
+                scored = score_answer(parsed, answer)
+                self.assertTrue(scored["valid"])
+                self.assertGreater(scored["covered"], 0)
+
+        default_scored = score_answer(parsed, seed_solvers.solve(CASE_TEXT))
+        self.assertTrue(default_scored["valid"])
 
     def test_validator_rejects_duplicate_and_dangerous_code(self):
         parsed = parse_case(CASE_TEXT)

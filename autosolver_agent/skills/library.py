@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import asdict
 from typing import Any, Dict, List
 
-from autosolver_agent.models import SolverSkill, StrategySpec
+from autosolver_agent.models import SolverExample, SolverSkill, StrategySpec
 
 
 class StrategyLibrary:
@@ -25,6 +25,11 @@ class StrategyLibrary:
                 example_signals={"pair_ratio_max": 0.25, "capacity_ratio_min": 1.0},
                 risks=["Can miss useful bundled orders when pair rows are important."],
                 recommended_parameters={"coverage_weight": 8.0, "willingness_weight": 8.0},
+                reference_examples=[
+                    "basic_seed_solver_pack",
+                    "task_first_greedy_repair_reference",
+                    "multi_start_hybrid_reference",
+                ],
             ),
             StrategySpec(
                 name="bundle_first",
@@ -37,6 +42,11 @@ class StrategyLibrary:
                 example_signals={"pair_ratio_min": 0.2, "capacity_ratio_max": 1.6},
                 risks=["Overusing bundles may block better single-task assignments."],
                 recommended_parameters={"pair_weight": 45.0, "coverage_weight": 12.0},
+                reference_examples=[
+                    "basic_seed_solver_pack",
+                    "task_first_greedy_repair_reference",
+                    "multi_start_hybrid_reference",
+                ],
             ),
             StrategySpec(
                 name="willingness_weighted",
@@ -49,6 +59,11 @@ class StrategyLibrary:
                 example_signals={"avg_willingness_max": 0.35},
                 risks=["May pay higher score when score values vary widely."],
                 recommended_parameters={"willingness_weight": 35.0, "extra_limit": 120},
+                reference_examples=[
+                    "basic_seed_solver_pack",
+                    "task_first_greedy_repair_reference",
+                    "multi_start_hybrid_reference",
+                ],
             ),
             StrategySpec(
                 name="flow_single_initial",
@@ -61,6 +76,7 @@ class StrategyLibrary:
                 example_signals={"capacity_ratio_min": 1.0, "pair_ratio_max": 0.35},
                 risks=["Single-task flow ignores bundles in the initial phase."],
                 recommended_parameters={"use_flow": True},
+                reference_examples=["basic_seed_solver_pack", "multi_start_hybrid_reference"],
             ),
             StrategySpec(
                 name="beam_cover",
@@ -73,6 +89,11 @@ class StrategyLibrary:
                 example_signals={"task_count_max": 45},
                 risks=["Mask search should be disabled for large task counts to avoid timeout."],
                 recommended_parameters={"beam_width": 160, "beam_task_limit": 42},
+                reference_examples=[
+                    "basic_seed_solver_pack",
+                    "task_first_greedy_repair_reference",
+                    "multi_start_hybrid_reference",
+                ],
             ),
             StrategySpec(
                 name="local_search_repair",
@@ -85,6 +106,11 @@ class StrategyLibrary:
                 example_signals={"always": True},
                 risks=["Local search must respect a strict internal deadline."],
                 recommended_parameters={"local_rounds": 3, "loop_local_rounds": 1},
+                reference_examples=[
+                    "basic_seed_solver_pack",
+                    "task_first_greedy_repair_reference",
+                    "multi_start_hybrid_reference",
+                ],
             ),
         ]
 
@@ -151,15 +177,174 @@ class SolverSkillLibrary:
                 examples=[
                     "For high pair_ratio, try bundle-biased greedy plus repair.",
                     "For low willingness, add unused eligible couriers when expected penalty decreases.",
+                    "Use solver_examples as reference architectures; adapt the patterns instead of copying every routine.",
                 ],
             )
+        ]
+        self._examples = [
+            SolverExample(
+                name="basic_seed_solver_pack",
+                source_file="solvers/seed_solvers.py",
+                strategy_names=[
+                    "expected_greedy",
+                    "bundle_first",
+                    "willingness_weighted",
+                    "flow_single_initial",
+                    "beam_cover",
+                    "local_search_repair",
+                ],
+                summary=(
+                    "A directly callable pack of complete baseline seed solvers. Each strategy has its own solve_* "
+                    "entry point plus a default solve() that runs the local_search_repair seed."
+                ),
+                applicable_features=[
+                    "general",
+                    "small_task_count",
+                    "many_couriers",
+                    "scarce_couriers",
+                    "high_pair_ratio",
+                    "low_willingness",
+                    "low_pair_ratio",
+                ],
+                entry_points=[
+                    "solve_expected_greedy(input_text)",
+                    "solve_bundle_first(input_text)",
+                    "solve_willingness_weighted(input_text)",
+                    "solve_flow_single_initial(input_text)",
+                    "solve_beam_cover(input_text)",
+                    "solve_local_search_repair(input_text)",
+                    "SEED_SOLVERS[strategy_name](input_text)",
+                ],
+                reusable_patterns=[
+                    "Use one shared parser and penalty model, then vary the group/courier ranking function per strategy.",
+                    "Run a coverage repair pass after every seed construction to keep output valid.",
+                    "Use min-cost flow only for the single-task initial solution, then repair missing tasks with bundle rows.",
+                    "Use beam search only on bounded task counts and fall back to bundle-first greedy for larger cases.",
+                    "Use local replacement search to swap conflicting active groups for better bundle or penalty choices.",
+                ],
+                implementation_guardrails=[
+                    "Every public solver returns the official list-of-tuples answer shape.",
+                    "The module uses only Python standard library imports.",
+                    "The default solve() remains callable by the existing candidate runtime and validator.",
+                ],
+                prompt_excerpt=(
+                    "Reference seed pack: call solve_expected_greedy, solve_bundle_first, solve_willingness_weighted, "
+                    "solve_flow_single_initial, solve_beam_cover, or solve_local_search_repair. "
+                    "Each function parses TSV, constructs a valid disjoint seed, repairs missing coverage, "
+                    "adds improving extra couriers, and formats the answer."
+                ),
+            ),
+            SolverExample(
+                name="task_first_greedy_repair_reference",
+                source_file="solvers/solver.py",
+                strategy_names=[
+                    "expected_greedy",
+                    "bundle_first",
+                    "willingness_weighted",
+                    "beam_cover",
+                    "local_search_repair",
+                ],
+                summary=(
+                    "Deterministic task-first construction that parses TSV rows into compact task-group and courier ids, "
+                    "builds one feasible cover, greedily adds useful extra couriers, then repairs and polishes."
+                ),
+                applicable_features=[
+                    "general",
+                    "small_task_count",
+                    "high_pair_ratio",
+                    "low_willingness",
+                    "needs_penalty_optimization",
+                ],
+                entry_points=[
+                    "solve: parse_input -> construct_task_first_greedy_solution -> repair_task_coverage -> format_solution",
+                    "construct_task_first_greedy_solution: choose cover groups, seed variants, pair replacement, three-cycle polish",
+                    "polish_courier_assignment: relocate, swap, then add remaining couriers by penalty gain",
+                    "repair_task_coverage: direct missing-group add or replacement of conflicting active groups",
+                ],
+                reusable_patterns=[
+                    "Represent each task group as a bitmask so coverage/conflict checks are O(1).",
+                    "Track owner[courier], active groups, assigned couriers, covered task mask, and incremental penalty stats.",
+                    "Seed one courier per group using regret, singleton penalty, willingness, name order, and hash order variants.",
+                    "Only add unused couriers when penalty_after_add improves the active group penalty.",
+                    "Run local repair in bounded passes: relocate courier, swap couriers, add extras, replace pair groups, repair coverage.",
+                ],
+                implementation_guardrails=[
+                    "Keep all output task groups disjoint and every courier globally unique.",
+                    "After any bundle replacement or destroy step, call coverage repair before formatting the answer.",
+                    "Use deterministic tie-breakers for stable artifacts and easier scorer comparisons.",
+                ],
+                prompt_excerpt=(
+                    "Reference outline from solver.py: parse into ProblemData/State; choose_cover_groups; "
+                    "seed_groups_by_regret or ordered/hash seeds; allocate_remaining_couriers_by_gain; "
+                    "polish by relocate_couriers_by_gain and swap_couriers_by_gain; "
+                    "repair uncovered tasks with direct or replacement coverage moves."
+                ),
+            ),
+            SolverExample(
+                name="multi_start_hybrid_reference",
+                source_file="solvers/solver_70433_best_E1.py",
+                strategy_names=[
+                    "expected_greedy",
+                    "bundle_first",
+                    "willingness_weighted",
+                    "flow_single_initial",
+                    "beam_cover",
+                    "local_search_repair",
+                ],
+                summary=(
+                    "Fused multi-start solver that keeps the same incremental State model, tries multiple initial "
+                    "constructors under a hard deadline, and iterates with perturbation, tabu-style swaps, and repair."
+                ),
+                applicable_features=[
+                    "many_couriers",
+                    "low_pair_ratio",
+                    "scarce_couriers",
+                    "low_willingness",
+                    "large_task_count",
+                    "needs_penalty_optimization",
+                ],
+                entry_points=[
+                    "solve: deterministic seeds -> structured initial solutions -> iterative local search until deadline",
+                    "init_min_cost_flow_single: single-task min-cost assignment for many-courier low-pair cases",
+                    "init_min_weight_matching: scarce-courier one-row matching seed",
+                    "init_shuffled_greedy: randomized greedy with temperature, pair_bias, and willingness_bias",
+                    "destroy_repair / kick_state / perturb_extras / tabu_confchange: diversification and local improvement",
+                ],
+                reusable_patterns=[
+                    "Classify the instance inside solve with avg_willingness, courier/task ratio, scarce_case, low_case, and hard_case.",
+                    "Consider every seed through a single better_state gate and clone the best state to avoid accidental mutation.",
+                    "Use deadline checks before expensive starts; scale optional work by remaining time and instance size.",
+                    "For low willingness, increase willingness_bias; for scarce cases, increase pair_bias to explore bundled cover.",
+                    "Alternate structured seeds with perturb/destroy-repair loops, then polish and re-evaluate the best state.",
+                ],
+                implementation_guardrails=[
+                    "Keep an internal safety margin below the judge timeout.",
+                    "Do not introduce non-standard packages; matching/flow/LP-style routines must be standard-library implementations.",
+                    "Disable expensive mask/partition or structured starts on large instances unless time_left is clearly sufficient.",
+                ],
+                prompt_excerpt=(
+                    "Reference outline from solver_70433_best_E1.py: build deterministic task-first and hash seeds; "
+                    "optionally try init_min_cost_flow_single and init_min_weight_matching seeds; "
+                    "for suitable cases try compact bundle starts; "
+                    "loop until deadline with destroy_repair, kick_state, perturb_extras, randomized greedy, tabu_confchange, "
+                    "and final polish; return format_solution(best)."
+                ),
+            ),
         ]
 
     def all(self) -> List[SolverSkill]:
         return list(self._skills)
 
+    def examples(self) -> List[SolverExample]:
+        return list(self._examples)
+
     def as_prompt_context(self) -> str:
-        return _compact_json({"solver_skills": [asdict(item) for item in self._skills]})
+        return _compact_json(
+            {
+                "solver_skills": [asdict(item) for item in self._skills],
+                "solver_examples": [asdict(item) for item in self._examples],
+            }
+        )
 
 
 def _compact_json(value: Any) -> str:

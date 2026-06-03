@@ -34,6 +34,7 @@ class StrategySpec:
     example_signals: Dict[str, Any]
     risks: List[str] = field(default_factory=list)
     recommended_parameters: Dict[str, Any] = field(default_factory=dict)
+    reference_examples: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -44,6 +45,19 @@ class SolverSkill:
     code_contract: str
     constraints: List[str]
     examples: List[str] = field(default_factory=list)
+
+
+@dataclass
+class SolverExample:
+    name: str
+    source_file: str
+    strategy_names: List[str]
+    summary: str
+    applicable_features: List[str]
+    entry_points: List[str]
+    reusable_patterns: List[str]
+    implementation_guardrails: List[str]
+    prompt_excerpt: str
 
 
 @dataclass
