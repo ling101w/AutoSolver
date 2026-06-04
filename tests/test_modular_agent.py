@@ -108,6 +108,10 @@ class ModularAgentTests(unittest.TestCase):
         self.assertEqual(parsed.all_tasks, ["t0", "t1"])
         features = InstanceClassifier().classify([Case("case.txt", CASE_TEXT)], [parsed])
         self.assertIn("recommended_focus", features["aggregate"])
+        self.assertIn("feature_library", features)
+        self.assertIn("bundle_ratio", features["aggregate"])
+        self.assertIn("single_cover_available", features["aggregate"]["tags"])
+        self.assertIn("pair_replacement_polish", features["aggregate"]["recommended_focus"])
         scored = score_answer(parsed, [("t0,t1", ["c2"])])
         self.assertTrue(scored["valid"])
         self.assertEqual(scored["covered"], 2)
@@ -127,13 +131,26 @@ class ModularAgentTests(unittest.TestCase):
         strategy_by_name = {item["name"]: item for item in strategy_payload["strategies"]}
         self.assertIn("basic_seed_solver_pack", strategy_by_name["bundle_first"]["reference_examples"])
         self.assertIn("task_first_greedy_repair_reference", strategy_by_name["bundle_first"]["reference_examples"])
+        self.assertIn("pair_replacement_polish", strategy_by_name)
+        self.assertIn("tabu_confchange", strategy_by_name)
+        self.assertIn("template_task_first_reference", strategy_by_name["pair_replacement_polish"]["reference_examples"])
 
         solver_payload = json.loads(SolverSkillLibrary().as_prompt_context())
+        skill_by_name = {item["name"]: item for item in solver_payload["solver_skills"]}
+        self.assertIn("incremental_bitmask_state", skill_by_name)
+        self.assertIn("metaheuristic_loop_control", skill_by_name)
+        self.assertIn("coverage_repair_guardrails", skill_by_name)
         example_by_name = {item["name"]: item for item in solver_payload["solver_examples"]}
         self.assertEqual(example_by_name["basic_seed_solver_pack"]["source_file"], "solvers/seed_solvers.py")
         self.assertEqual(example_by_name["task_first_greedy_repair_reference"]["source_file"], "solvers/solver.py")
         self.assertEqual(example_by_name["multi_start_hybrid_reference"]["source_file"], "solvers/solver_70433_best_E1.py")
+        self.assertEqual(example_by_name["template_task_first_reference"]["source_file"], "examples/solver_template_2.py")
+        self.assertEqual(
+            example_by_name["template_hybrid_metaheuristic_reference"]["source_file"],
+            "examples/solver_template_1.py",
+        )
         self.assertIn("init_min_cost_flow_single", example_by_name["multi_start_hybrid_reference"]["prompt_excerpt"])
+        self.assertIn("tabu_confchange", example_by_name["template_hybrid_metaheuristic_reference"]["prompt_excerpt"])
 
     def test_seed_solvers_are_directly_callable_and_valid(self):
         parsed = parse_case(CASE_TEXT)

@@ -112,6 +112,170 @@ class StrategyLibrary:
                     "multi_start_hybrid_reference",
                 ],
             ),
+            StrategySpec(
+                name="task_first_regret_seed",
+                description="Build a full task cover first, seeding one courier per group by regret between best choices.",
+                implementation_notes=(
+                    "Use bitmasks for task groups, choose disjoint cover groups, then assign the group with the largest "
+                    "gap between its best and second-best available courier. Finish with extra-courier gain filling."
+                ),
+                suitable_features=["general", "single_cover_available", "sparse_candidate_groups", "tight_capacity"],
+                example_signals={"single_task_group_coverage_min": 0.7, "avg_candidates_per_group_min": 1.5},
+                risks=["Regret seed is deterministic and may overfit tie order without hash/order variants."],
+                recommended_parameters={"regret_weight": 1.0, "seed_order_variants": 4},
+                reference_examples=[
+                    "task_first_greedy_repair_reference",
+                    "template_task_first_reference",
+                ],
+            ),
+            StrategySpec(
+                name="hash_multi_start",
+                description="Run deterministic hash-order seed variants to diversify without random instability.",
+                implementation_notes=(
+                    "Sort selected cover groups by several stable integer hash seeds, construct ordered seed states, "
+                    "polish each one, and keep the best by coverage then penalty."
+                ),
+                suitable_features=["high_score_variance", "large_task_count", "needs_tie_diversification"],
+                example_signals={"score_cv_min": 0.5, "task_count_min": 40},
+                risks=["Too many hash starts can spend time before deeper local improvement."],
+                recommended_parameters={"hash_seeds": [289, 245, 173, 95, 242], "max_hash_starts": 5},
+                reference_examples=[
+                    "task_first_greedy_repair_reference",
+                    "multi_start_hybrid_reference",
+                    "template_task_first_reference",
+                    "template_hybrid_metaheuristic_reference",
+                ],
+            ),
+            StrategySpec(
+                name="pair_replacement_polish",
+                description="Replace two active singleton groups with a compatible pair group when it lowers penalty.",
+                implementation_notes=(
+                    "Shortlist cheap pair groups, simulate replacing their active singleton components, then apply the "
+                    "best improving replacement followed by courier-gain polish."
+                ),
+                suitable_features=["bundle_rich", "high_pair_ratio", "small_task_count", "medium_task_count"],
+                example_signals={"bundle_ratio_min": 0.15, "single_task_group_coverage_min": 0.7},
+                risks=["Pair replacement should reject overlapping or uncovered-task regressions."],
+                recommended_parameters={"candidate_limit": 120, "shortlist": 20, "rounds": 4},
+                reference_examples=[
+                    "task_first_greedy_repair_reference",
+                    "template_task_first_reference",
+                    "template_hybrid_metaheuristic_reference",
+                ],
+            ),
+            StrategySpec(
+                name="courier_relocation_swap",
+                description="Move or swap assigned couriers between active groups using incremental penalty deltas.",
+                implementation_notes=(
+                    "Track each courier owner and each group's penalty statistics. Repeatedly relocate one courier or "
+                    "swap two couriers when the combined delta is negative, then refill improving extras."
+                ),
+                suitable_features=["dense_candidate_groups", "mobile_couriers", "needs_penalty_optimization"],
+                example_signals={"avg_groups_per_courier_min": 2.0, "avg_candidates_per_group_min": 3.0},
+                risks=["Must keep at least one courier per active group and preserve global courier uniqueness."],
+                recommended_parameters={"local_passes": 6, "delta_epsilon": 1e-12},
+                reference_examples=[
+                    "task_first_greedy_repair_reference",
+                    "multi_start_hybrid_reference",
+                    "template_task_first_reference",
+                ],
+            ),
+            StrategySpec(
+                name="three_cycle_polish",
+                description="Search three active groups for cyclic courier rotations that reduce total penalty.",
+                implementation_notes=(
+                    "For compact active sets, test A->B->C->A and A->C->B->A courier rotations and apply a few "
+                    "negative-delta cycles, with local polish after each application."
+                ),
+                suitable_features=["dense_candidate_groups", "mobile_couriers", "small_task_count"],
+                example_signals={"active_group_max": 45, "avg_groups_per_courier_min": 2.5},
+                risks=["Cubic scans must be disabled on large active sets."],
+                recommended_parameters={"move_limit": 5, "max_active_groups": 45},
+                reference_examples=[
+                    "task_first_greedy_repair_reference",
+                    "template_task_first_reference",
+                ],
+            ),
+            StrategySpec(
+                name="randomized_shuffled_greedy",
+                description="Use seeded randomized row ordering with temperature, pair bias, and willingness bias.",
+                implementation_notes=(
+                    "Score each group-courier row by singleton penalty per task, bundle bias, willingness bias, and "
+                    "small seeded random noise. Construct disjoint seeds, repair missing tasks, then polish."
+                ),
+                suitable_features=["high_score_variance", "very_low_willingness_tail", "scarce_couriers", "large_task_count"],
+                example_signals={"score_cv_min": 0.5, "avg_willingness_max": 0.35},
+                risks=["Needs deterministic RNG seeding for reproducible artifacts."],
+                recommended_parameters={"temperature_schedule": [1.5, 4.0, 9.0, 18.0], "pair_bias_max": 140.0},
+                reference_examples=[
+                    "multi_start_hybrid_reference",
+                    "template_hybrid_metaheuristic_reference",
+                ],
+            ),
+            StrategySpec(
+                name="min_weight_matching_seed",
+                description="Construct a one-row-per-task/group matching seed for scarce-courier cases.",
+                implementation_notes=(
+                    "When couriers are tight, choose non-overlapping group-courier rows with a matching-style objective, "
+                    "favoring coverage first and expected singleton penalty second."
+                ),
+                suitable_features=["scarce_couriers", "tight_capacity", "single_cover_available"],
+                example_signals={"capacity_ratio_max": 1.35},
+                risks=["A pure row matching seed may underuse beneficial secondary couriers until later polish."],
+                recommended_parameters={"coverage_bonus": 10000.0, "scarce_pair_bias": 60.0},
+                reference_examples=[
+                    "multi_start_hybrid_reference",
+                    "template_hybrid_metaheuristic_reference",
+                ],
+            ),
+            StrategySpec(
+                name="tabu_confchange",
+                description="Run bounded tabu-style move and swap search with conflict-change gating.",
+                implementation_notes=(
+                    "Maintain short tabu tenures for courier/group moves, allow aspiration if a move improves the best "
+                    "state, and use conflict-change flags to skip stale neighborhoods."
+                ),
+                suitable_features=["large_task_count", "dense_candidate_groups", "needs_penalty_optimization"],
+                example_signals={"task_count_min": 80, "avg_candidates_per_group_min": 3.0},
+                risks=["Must use deadline checks and cap sampled swaps to avoid timeout."],
+                recommended_parameters={"default_steps": 18, "swap_trials": 80, "tenure_base": 4},
+                reference_examples=[
+                    "multi_start_hybrid_reference",
+                    "template_hybrid_metaheuristic_reference",
+                ],
+            ),
+            StrategySpec(
+                name="destroy_repair_ils",
+                description="Iteratively perturb the current state by dropping groups or extras, then greedily repair.",
+                implementation_notes=(
+                    "Alternate perturb_extras, kick_state, and destroy_repair against the current best clone. After each "
+                    "perturbation, repair coverage, refill improving couriers, and apply local polish."
+                ),
+                suitable_features=["large_task_count", "high_reject_risk", "high_score_variance"],
+                example_signals={"task_count_min": 60, "low_willingness_ratio_min": 0.35},
+                risks=["Destroy size should grow slowly and always leave enough time to repair coverage."],
+                recommended_parameters={"max_drop_count": 4, "kick_strength_max": 8, "no_improve_reset": 4},
+                reference_examples=[
+                    "multi_start_hybrid_reference",
+                    "template_hybrid_metaheuristic_reference",
+                ],
+            ),
+            StrategySpec(
+                name="repartition_small_union",
+                description="Repartition tasks across two active groups when the union is small enough to enumerate.",
+                implementation_notes=(
+                    "Focus on high-penalty active pairs whose union has at most a few tasks and couriers. Enumerate "
+                    "existing singleton/pair group partitions and brute-force courier assignment within that small union."
+                ),
+                suitable_features=["bundle_rich", "small_task_count", "medium_task_count", "dense_candidate_groups"],
+                example_signals={"max_union_tasks": 4, "max_union_couriers": 6},
+                risks=["Only run on tiny unions and high-penalty focus sets."],
+                recommended_parameters={"max_tasks": 4, "max_couriers": 6, "focus_fraction": 0.6},
+                reference_examples=[
+                    "multi_start_hybrid_reference",
+                    "template_hybrid_metaheuristic_reference",
+                ],
+            ),
         ]
 
     def all(self) -> List[StrategySpec]:
@@ -119,19 +283,42 @@ class StrategyLibrary:
 
     def select_for_features(self, features: Dict[str, Any]) -> List[StrategySpec]:
         pair_ratio = float(features.get("pair_ratio", 0.0) or 0.0)
+        bundle_ratio = float(features.get("bundle_ratio", 0.0) or 0.0)
         avg_willingness = float(features.get("avg_willingness", 0.0) or 0.0)
+        low_willingness_ratio = float(features.get("low_willingness_ratio", 0.0) or 0.0)
         capacity_ratio = float(features.get("capacity_ratio", 0.0) or 0.0)
         task_count = int(features.get("task_count", 0) or 0)
-        names = {"expected_greedy", "local_search_repair"}
-        if pair_ratio >= 0.2 or capacity_ratio < 1.4:
+        avg_candidates = float(features.get("avg_candidates_per_group", 0.0) or 0.0)
+        avg_groups_per_courier = float(features.get("avg_groups_per_courier", 0.0) or 0.0)
+        score_cv = float(features.get("score_cv", 0.0) or 0.0)
+        single_cover = float(features.get("single_task_group_coverage", 0.0) or 0.0)
+        tags = set(features.get("tags", []))
+        names = {"expected_greedy", "local_search_repair", "task_first_regret_seed", "courier_relocation_swap"}
+        if pair_ratio >= 0.2 or bundle_ratio >= 0.15 or capacity_ratio < 1.4 or "bundle_rich" in tags:
             names.add("bundle_first")
             names.add("beam_cover")
+            names.add("pair_replacement_polish")
         if avg_willingness <= 0.35:
             names.add("willingness_weighted")
-        if capacity_ratio >= 1.0 and pair_ratio <= 0.35:
+        if low_willingness_ratio >= 0.35:
+            names.add("destroy_repair_ils")
+        if capacity_ratio >= 1.0 and pair_ratio <= 0.35 and single_cover >= 0.8:
             names.add("flow_single_initial")
+        if capacity_ratio <= 1.35:
+            names.add("min_weight_matching_seed")
         if task_count <= 45:
             names.add("beam_cover")
+            names.add("three_cycle_polish")
+            if bundle_ratio >= 0.1:
+                names.add("repartition_small_union")
+        if avg_candidates >= 3.0 or avg_groups_per_courier >= 2.5:
+            names.add("three_cycle_polish")
+            names.add("tabu_confchange")
+        if task_count >= 80 or score_cv >= 0.5:
+            names.add("hash_multi_start")
+            names.add("randomized_shuffled_greedy")
+        if task_count >= 100 or score_cv >= 0.8:
+            names.add("destroy_repair_ils")
         return [strategy for strategy in self._strategies if strategy.name in names]
 
     def as_prompt_context(self, features: Dict[str, Any]) -> str:
@@ -157,6 +344,16 @@ class SolverSkillLibrary:
                     "flow_single_initial",
                     "beam_cover",
                     "local_search_repair",
+                    "task_first_regret_seed",
+                    "hash_multi_start",
+                    "pair_replacement_polish",
+                    "courier_relocation_swap",
+                    "three_cycle_polish",
+                    "randomized_shuffled_greedy",
+                    "min_weight_matching_seed",
+                    "tabu_confchange",
+                    "destroy_repair_ils",
+                    "repartition_small_union",
                 ],
                 construction_notes=(
                     "Generate one complete Python file using only the standard library. It must expose "
@@ -179,7 +376,128 @@ class SolverSkillLibrary:
                     "For low willingness, add unused eligible couriers when expected penalty decreases.",
                     "Use solver_examples as reference architectures; adapt the patterns instead of copying every routine.",
                 ],
-            )
+            ),
+            SolverSkill(
+                name="incremental_bitmask_state",
+                strategy_names=[
+                    "task_first_regret_seed",
+                    "pair_replacement_polish",
+                    "courier_relocation_swap",
+                    "three_cycle_polish",
+                    "repartition_small_union",
+                    "tabu_confchange",
+                ],
+                construction_notes=(
+                    "Represent each task group by an integer mask and maintain State with active groups, assigned couriers, "
+                    "owner[courier], covered mask, incremental willingness sums, reject product, and group penalty."
+                ),
+                code_contract="Keep all state mutation in add_courier/remove_courier/remove_group helpers with invariant-preserving updates.",
+                constraints=[
+                    "A courier owner must be -1 or exactly one active group.",
+                    "An active group must have at least one assigned courier before formatting output.",
+                    "covered_count must be derived from the task mask after group activation/removal.",
+                ],
+                examples=[
+                    "Use penalty_after_add and penalty_after_remove to evaluate moves without mutating.",
+                    "Clone and restore states before evaluating destructive pair or repartition moves.",
+                ],
+            ),
+            SolverSkill(
+                name="deterministic_seed_constructors",
+                strategy_names=[
+                    "expected_greedy",
+                    "bundle_first",
+                    "task_first_regret_seed",
+                    "hash_multi_start",
+                    "min_weight_matching_seed",
+                    "flow_single_initial",
+                ],
+                construction_notes=(
+                    "Generate several valid initial covers: task-first regret, ordered by name, ordered by best penalty, "
+                    "ordered by willingness, stable hash-order starts, and optional flow/matching starts."
+                ),
+                code_contract="Every constructor should return a valid State or None and must be passed through the same better_state gate.",
+                constraints=[
+                    "Prefer full coverage before optimizing penalty.",
+                    "Use deterministic tie-breakers so artifacts are reproducible.",
+                    "Disable expensive constructors when feature thresholds or time_left checks fail.",
+                ],
+                examples=[
+                    "For scarce couriers, try min_weight_matching_seed before randomized starts.",
+                    "For single_cover_available and low_pair_ratio, try flow_single_initial as a stable baseline.",
+                ],
+            ),
+            SolverSkill(
+                name="local_move_polisher",
+                strategy_names=[
+                    "local_search_repair",
+                    "courier_relocation_swap",
+                    "three_cycle_polish",
+                    "pair_replacement_polish",
+                    "repartition_small_union",
+                ],
+                construction_notes=(
+                    "Improve a valid state with bounded negative-delta moves: add improving extras, relocate couriers, "
+                    "swap couriers between groups, replace singleton pairs by bundle groups, and apply tiny three-cycles."
+                ),
+                code_contract="Each move must be evaluated with exact penalty deltas and applied only if it preserves validity.",
+                constraints=[
+                    "Never leave an active group empty unless removing the whole group.",
+                    "Run coverage repair after any group replacement or repartition step.",
+                    "Cap cubic cycle scans by active group count.",
+                ],
+                examples=[
+                    "Run relocate -> swap -> add extras in repeated polish passes.",
+                    "For bundle_rich cases, shortlist cheap pair groups before detailed replacement simulation.",
+                ],
+            ),
+            SolverSkill(
+                name="metaheuristic_loop_control",
+                strategy_names=[
+                    "randomized_shuffled_greedy",
+                    "destroy_repair_ils",
+                    "tabu_confchange",
+                    "hash_multi_start",
+                ],
+                construction_notes=(
+                    "Use a deadline-aware multi-start loop that alternates deterministic starts, randomized greedy starts, "
+                    "destroy-repair perturbations, kick moves, extra-courier perturbation, and tabu/conf-change search."
+                ),
+                code_contract="Seed RNG deterministically from instance size and stop all optional work before the internal safety margin.",
+                constraints=[
+                    "Always keep the current best clone separate from the working state.",
+                    "Jump back to best after several non-improving rounds.",
+                    "Scale temperature, pair_bias, and willingness_bias from feature tags such as scarce or low willingness.",
+                ],
+                examples=[
+                    "Use larger pair_bias for scarce or bundle-rich cases.",
+                    "Use larger willingness_bias for very_low_willingness_tail cases.",
+                ],
+            ),
+            SolverSkill(
+                name="coverage_repair_guardrails",
+                strategy_names=[
+                    "bundle_first",
+                    "beam_cover",
+                    "destroy_repair_ils",
+                    "repartition_small_union",
+                    "local_search_repair",
+                ],
+                construction_notes=(
+                    "After any partial construction, fill uncovered tasks by direct non-conflicting groups first, then by "
+                    "replacing conflicting active groups only when all removed tasks remain covered by the new group."
+                ),
+                code_contract="Repair functions must return whether full coverage was restored and must leave the state valid even on failure.",
+                constraints=[
+                    "Do not emit duplicate tasks.",
+                    "Do not steal a courier from a singleton group unless that group is also removed or still has another courier.",
+                    "Prefer direct repairs over replacement repairs for simplicity and validity.",
+                ],
+                examples=[
+                    "best_direct_coverage_repair handles missing task masks with unused couriers.",
+                    "best_replacement_coverage_repair can activate a bundle group when it exactly covers conflicting singleton groups.",
+                ],
+            ),
         ]
         self._examples = [
             SolverExample(
@@ -328,6 +646,100 @@ class SolverSkillLibrary:
                     "for suitable cases try compact bundle starts; "
                     "loop until deadline with destroy_repair, kick_state, perturb_extras, randomized greedy, tabu_confchange, "
                     "and final polish; return format_solution(best)."
+                ),
+            ),
+            SolverExample(
+                name="template_task_first_reference",
+                source_file="examples/solver_template_2.py",
+                strategy_names=[
+                    "task_first_regret_seed",
+                    "hash_multi_start",
+                    "pair_replacement_polish",
+                    "courier_relocation_swap",
+                    "three_cycle_polish",
+                    "local_search_repair",
+                ],
+                summary=(
+                    "Compact deterministic template centered on bitmask State, task-first cover selection, regret seeding, "
+                    "hash-order variants, pair replacement, three-courier cycle polish, and explicit coverage repair."
+                ),
+                applicable_features=[
+                    "small_task_count",
+                    "medium_task_count",
+                    "single_cover_available",
+                    "bundle_rich",
+                    "dense_candidate_groups",
+                    "compact_mask_search_candidate",
+                ],
+                entry_points=[
+                    "solve -> parse_input -> construct_task_first_greedy_solution -> repair_task_coverage -> format_solution",
+                    "initial_single_task_states: regret seed plus name, penalty, willingness, and hash-order starts",
+                    "improve_by_pair_group_replacements and polish_three_courier_cycles for compact local improvement",
+                ],
+                reusable_patterns=[
+                    "Keep a single incremental State model and never optimize on raw output tuples.",
+                    "Use choose_cover_groups to separate task coverage from courier assignment.",
+                    "Use exact penalty_after_add/remove deltas for extras, relocation, swaps, and cycle moves.",
+                    "Call repair_task_coverage after any replacement that may uncover tasks.",
+                ],
+                implementation_guardrails=[
+                    "Do not run three-cycle scans when active groups exceed the configured cap.",
+                    "Pair replacement should only replace active singleton groups that exactly match the pair mask.",
+                    "Every formatting step sorts stable names for deterministic output.",
+                ],
+                prompt_excerpt=(
+                    "Template 2 useful outline: bitmask ProblemData/State; construct_task_first_greedy_solution; "
+                    "initial_single_task_states with regret and hash orders; allocate_remaining_couriers_by_gain; "
+                    "relocate/swap polish; pair replacement; coverage repair; three-cycle polish."
+                ),
+            ),
+            SolverExample(
+                name="template_hybrid_metaheuristic_reference",
+                source_file="examples/solver_template_1.py",
+                strategy_names=[
+                    "task_first_regret_seed",
+                    "hash_multi_start",
+                    "randomized_shuffled_greedy",
+                    "min_weight_matching_seed",
+                    "flow_single_initial",
+                    "tabu_confchange",
+                    "destroy_repair_ils",
+                    "repartition_small_union",
+                    "local_search_repair",
+                ],
+                summary=(
+                    "Full hybrid template that adds instance-adaptive multi-start construction, matching/flow seeds, "
+                    "randomized greedy schedules, tabu/conf-change moves, destroy-repair, kicks, perturbation, and repartition."
+                ),
+                applicable_features=[
+                    "large_task_count",
+                    "scarce_couriers",
+                    "tight_capacity",
+                    "very_low_willingness_tail",
+                    "high_reject_risk",
+                    "high_score_variance",
+                    "dense_candidate_groups",
+                ],
+                entry_points=[
+                    "solve: deterministic phase -> optional structured starts -> ILS loop until deadline",
+                    "init_shuffled_greedy with temperature, pair_bias, willingness_bias schedules",
+                    "tabu_confchange, perturb_extras, kick_state, destroy_repair, repartition_state",
+                ],
+                reusable_patterns=[
+                    "Classify inside solve with scarce_case, low_case, very_low_case, and hard_case booleans.",
+                    "Gate expensive structured starts by time_left and instance size thresholds.",
+                    "Use best/current-work separation and restore best after several non-improving iterations.",
+                    "Scale pair_bias upward for scarce cases and willingness_bias upward for low acceptance tails.",
+                ],
+                implementation_guardrails=[
+                    "Reserve a safety margin and check time_left before every expensive optional phase.",
+                    "Keep randomized behavior deterministic with an instance-size-based seed.",
+                    "Do not enumerate repartitions unless task and courier union caps are satisfied.",
+                ],
+                prompt_excerpt=(
+                    "Template 1 useful outline: start from deterministic task-first seed; try hash seeds, flow and matching "
+                    "seeds when suitable; optionally use compact bundle starts; then run deadline-bounded ILS with shuffled "
+                    "greedy, tabu_confchange, perturb_extras, kick_state, destroy_repair, repartition, and final polish."
                 ),
             ),
         ]

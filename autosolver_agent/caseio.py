@@ -194,28 +194,77 @@ def dataset_features(parsed: ParsedCase) -> Dict[str, Any]:
             "row_count": 0,
             "task_count": 0,
             "courier_count": 0,
+            "group_count": 0,
             "pair_ratio": 0.0,
+            "bundle_ratio": 0.0,
+            "singleton_group_ratio": 0.0,
+            "max_group_size": 0,
+            "avg_group_size": 0.0,
             "avg_willingness": 0.0,
             "avg_score": 0.0,
+            "score_spread": 0.0,
+            "score_cv": 0.0,
             "high_willingness_ratio": 0.0,
+            "low_willingness_ratio": 0.0,
+            "very_low_willingness_ratio": 0.0,
+            "avg_candidates_per_group": 0.0,
+            "max_candidates_per_group": 0,
+            "avg_groups_per_courier": 0.0,
+            "max_groups_per_courier": 0,
+            "single_task_group_coverage": 0.0,
+            "bundle_task_coverage": 0.0,
             "low_capacity": False,
+            "capacity_ratio": 0.0,
         }
     pair_rows = sum(1 for tasks, *_ in rows if len(tasks) > 1)
+    group_sizes = [len(tasks) for tasks in parsed.key_tasks.values()]
+    bundle_groups = sum(1 for tasks in parsed.key_tasks.values() if len(tasks) > 1)
+    singleton_groups = sum(1 for tasks in parsed.key_tasks.values() if len(tasks) == 1)
     willingness_values = [r[4] for r in rows]
     score_values = [r[3] for r in rows]
     task_count = len(parsed.all_tasks)
     courier_count = len(parsed.all_couriers)
+    group_count = len(parsed.by_key)
+    candidates_per_group = [len(couriers) for couriers in parsed.by_key.values()]
+    groups_by_courier: Dict[str, set] = {}
+    bundle_tasks: Set[str] = set()
+    single_tasks: Set[str] = set()
+    for task_key, tasks in parsed.key_tasks.items():
+        target = bundle_tasks if len(tasks) > 1 else single_tasks
+        target.update(tasks)
+        for courier in parsed.by_key.get(task_key, {}):
+            groups_by_courier.setdefault(courier, set()).add(task_key)
+    groups_per_courier = [len(groups) for groups in groups_by_courier.values()]
+    avg_score = statistics.fmean(score_values)
+    score_stdev = statistics.pstdev(score_values) if len(score_values) > 1 else 0.0
     return {
         "row_count": len(rows),
         "task_count": task_count,
         "courier_count": courier_count,
+        "group_count": group_count,
         "pair_ratio": pair_rows / max(1, len(rows)),
+        "bundle_ratio": bundle_groups / max(1, group_count),
+        "singleton_group_ratio": singleton_groups / max(1, group_count),
+        "max_group_size": max(group_sizes) if group_sizes else 0,
+        "avg_group_size": statistics.fmean(group_sizes) if group_sizes else 0.0,
         "avg_willingness": statistics.fmean(willingness_values),
-        "avg_score": statistics.fmean(score_values),
+        "avg_score": avg_score,
+        "score_spread": max(score_values) - min(score_values),
+        "score_cv": score_stdev / max(1.0, abs(avg_score)),
         "high_willingness_ratio": sum(1 for v in willingness_values if v >= 0.5)
+        / max(1, len(willingness_values)),
+        "low_willingness_ratio": sum(1 for v in willingness_values if v < 0.3)
+        / max(1, len(willingness_values)),
+        "very_low_willingness_ratio": sum(1 for v in willingness_values if v < 0.16)
         / max(1, len(willingness_values)),
         "min_score": min(score_values),
         "max_score": max(score_values),
+        "avg_candidates_per_group": statistics.fmean(candidates_per_group) if candidates_per_group else 0.0,
+        "max_candidates_per_group": max(candidates_per_group) if candidates_per_group else 0,
+        "avg_groups_per_courier": statistics.fmean(groups_per_courier) if groups_per_courier else 0.0,
+        "max_groups_per_courier": max(groups_per_courier) if groups_per_courier else 0,
+        "single_task_group_coverage": len(single_tasks) / max(1, task_count),
+        "bundle_task_coverage": len(bundle_tasks) / max(1, task_count),
         "low_capacity": courier_count < task_count,
         "capacity_ratio": courier_count / max(1, task_count),
     }
