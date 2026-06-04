@@ -7,7 +7,7 @@ LABEL org.opencontainers.image.title="AutoSolver Agent" \
       org.opencontainers.image.description="LangGraph/LangChain delivery assignment solver generation agent" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${VCS_REF}" \
-      org.opencontainers.image.source="local" \
+      org.opencontainers.image.source="https://github.com/ling101w/codex-" \
       org.opencontainers.image.licenses="UNLICENSED"
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
