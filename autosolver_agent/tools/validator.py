@@ -7,8 +7,7 @@ from typing import Any, Dict, List
 
 from autosolver_agent.caseio import score_answer
 from autosolver_agent.models import Case, ParsedCase, ValidationResult
-from autosolver_agent.runtime import run_candidate
-
+from autosolver_agent.runtime import SAFE_IMPORT_ROOTS, run_candidate
 
 FORBIDDEN_IMPORT_ROOTS = {
     "os",
@@ -34,7 +33,29 @@ FORBIDDEN_CALLS = {
     "__import__",
     "input",
     "breakpoint",
+    "globals",
+    "locals",
+    "vars",
+    "dir",
+    "getattr",
+    "setattr",
+    "delattr",
+    "hasattr",
 }
+
+FORBIDDEN_NAMES = {
+    "__builtins__",
+    "__debug__",
+    "__file__",
+    "__loader__",
+    "__package__",
+    "__spec__",
+    "globals",
+    "locals",
+    "vars",
+}
+
+ALLOWED_IMPORT_ROOTS = set(SAFE_IMPORT_ROOTS)
 
 
 class Validator:
@@ -66,9 +87,17 @@ class Validator:
                 names = [alias.name for alias in node.names]
                 if isinstance(node, ast.ImportFrom) and node.module:
                     names.append(node.module)
+                if isinstance(node, ast.ImportFrom) and node.level:
+                    errors.append(
+                        {
+                            "type": "forbidden_import",
+                            "message": "relative imports are not allowed",
+                            "line": getattr(node, "lineno", None),
+                        }
+                    )
                 for name in names:
                     root = name.split(".")[0]
-                    if root in FORBIDDEN_IMPORT_ROOTS:
+                    if root in FORBIDDEN_IMPORT_ROOTS or root not in ALLOWED_IMPORT_ROOTS:
                         errors.append(
                             {
                                 "type": "forbidden_import",
@@ -83,6 +112,24 @@ class Validator:
                         {
                             "type": "forbidden_call",
                             "message": f"forbidden call: {call_name}",
+                            "line": getattr(node, "lineno", None),
+                        }
+                    )
+            elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+                if node.id in FORBIDDEN_NAMES:
+                    errors.append(
+                        {
+                            "type": "forbidden_name",
+                            "message": f"forbidden name: {node.id}",
+                            "line": getattr(node, "lineno", None),
+                        }
+                    )
+            elif isinstance(node, ast.Attribute):
+                if node.attr.startswith("__") and node.attr.endswith("__"):
+                    errors.append(
+                        {
+                            "type": "forbidden_attribute",
+                            "message": f"dunder attribute access is not allowed: {node.attr}",
                             "line": getattr(node, "lineno", None),
                         }
                     )

@@ -185,6 +185,7 @@ export AUTOSOLVER_DISABLE_RESPONSE_STORAGE=true
 - `runs/autosolver_summary.json`：可选摘要报告。
 - `runs/autosolver_memory/long_term_memory.json`：长期实验记忆。
 - `runs/autosolver_memory/short_term_last_run.json`：最近一次短期记忆。
+- `runs/autosolver_artifacts/events.jsonl`：结构化运行事件日志。
 - `runs/autosolver_artifacts/iteration_*/`：每轮候选代码、rationale、validation、score 和 impact。
 
 ## CLI 参数
@@ -207,6 +208,8 @@ export AUTOSOLVER_DISABLE_RESPONSE_STORAGE=true
 | `--memory-top-k` | `5` | 规划时检索的相似历史实验数量。 |
 | `--bandit-exploration` | `1.4` | UCB 探索系数。 |
 | `--summary-out` | `None` | 可选 JSON 摘要输出路径。 |
+| `--strict-cases` | `False` | 遇到坏 case 行时直接失败；默认只写入诊断。 |
+| `--event-log` | `artifact-dir/events.jsonl` | 可选 JSONL 结构化事件日志路径。 |
 | `--quiet` | `False` | 关闭运行日志。 |
 
 ## Python API
@@ -221,6 +224,8 @@ agent = AutoSolverLangChainAgent(
     per_case_timeout=5,
     search_per_case_timeout=2,
     iterations=3,
+    strict_cases=False,
+    event_log_path="runs/autosolver_artifacts/events.jsonl",
 )
 
 report = agent.run()
@@ -232,6 +237,10 @@ report = agent.run()
 
 ```bash
 .venv/bin/python -m unittest discover -s tests -v
+.venv/bin/python -m ruff check .
+.venv/bin/python -m mypy autosolver_agent
+.venv/bin/python -m coverage run -m unittest discover -s tests -v
+.venv/bin/python -m coverage report
 ```
 
 单元测试使用 fake LLM 响应，不需要网络访问。覆盖范围包括：
@@ -248,4 +257,3 @@ report = agent.run()
 - 生成 solver 的运行环境被刻意限制，主要用于比赛/评测式纯函数求解，不适合依赖外部文件、网络或第三方库。
 - 当前策略库是提示级知识库，实际最终算法由 LLM 生成，并通过验证、评分和记忆机制筛选。
 - `runs/` 下的 artifact 和 memory 是实验状态，适合保留用于后续迭代，但不应当视作源码的一部分。
-

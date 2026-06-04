@@ -31,6 +31,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--memory-top-k", type=int, default=5)
     parser.add_argument("--bandit-exploration", type=float, default=1.4)
     parser.add_argument("--summary-out", default=None, help="Optional JSON summary output path.")
+    parser.add_argument("--strict-cases", action="store_true", help="Fail on malformed case rows instead of reporting diagnostics.")
+    parser.add_argument("--event-log", default=None, help="Optional JSONL event log path; defaults to artifact-dir/events.jsonl.")
     parser.add_argument("--quiet", action="store_true")
     return parser
 
@@ -55,6 +57,8 @@ def main() -> None:
         memory_top_k=args.memory_top_k,
         bandit_exploration=args.bandit_exploration,
         summary_output_path=args.summary_out,
+        strict_cases=args.strict_cases,
+        event_log_path=args.event_log,
     )
     report = agent.run()
     print(json.dumps(report, indent=2, ensure_ascii=False, sort_keys=True))

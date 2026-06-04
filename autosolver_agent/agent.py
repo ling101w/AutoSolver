@@ -8,7 +8,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from autosolver_agent.artifacts import write_json
-from autosolver_agent.caseio import discover_case_paths, load_cases, parse_case
+from autosolver_agent.caseio import diagnostics_to_dicts, discover_case_paths, load_cases_with_diagnostics, parse_case
 from autosolver_agent.llm import LLMCodeGenerator
 from autosolver_agent.memory import MemoryStore
 from autosolver_agent.workflow import AutoSolverWorkflow
@@ -35,6 +35,8 @@ class AutoSolverLangChainAgent:
         memory_top_k: int = 5,
         bandit_exploration: float = 1.4,
         summary_output_path: Optional[str] = None,
+        strict_cases: bool = False,
+        event_log_path: Optional[str] = None,
     ) -> None:
         self.case_paths = case_paths or []
         self.output_path = output_path
@@ -54,10 +56,12 @@ class AutoSolverLangChainAgent:
         self.memory_top_k = memory_top_k
         self.bandit_exploration = bandit_exploration
         self.summary_output_path = summary_output_path
+        self.strict_cases = strict_cases
+        self.event_log_path = event_log_path
 
     def run(self) -> Dict[str, Any]:
         paths = self.case_paths or discover_case_paths(os.getcwd())
-        cases = load_cases(paths, self.max_cases)
+        cases, diagnostics = load_cases_with_diagnostics(paths, self.max_cases, strict=self.strict_cases)
         if not cases:
             raise RuntimeError("No valid case files found.")
         parsed_cases = [parse_case(case.text) for case in cases]
@@ -83,6 +87,8 @@ class AutoSolverLangChainAgent:
             memory_top_k=self.memory_top_k,
             bandit_exploration=self.bandit_exploration,
             summary_output_path=self.summary_output_path,
+            case_diagnostics=diagnostics_to_dicts(diagnostics),
+            event_log_path=self.event_log_path,
         )
         report = workflow.run()
         report_path = self.output_path + ".report.json"

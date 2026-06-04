@@ -10,7 +10,6 @@ from typing import Any, Dict, List, Optional, Sequence
 
 from autosolver_agent.models import ScoreResult, ValidationResult
 
-
 MEMORY_SCHEMA_VERSION = 2
 DEFAULT_MAX_LONG_TERM_ITEMS = 1000
 _CAPPED_LONG_TERM_KEYS = ("strategy_history", "feature_strategy_effects", "experiments")
@@ -356,7 +355,7 @@ class MemoryStore:
 class _FileLock:
     def __init__(self, path: str) -> None:
         self.path = path
-        self._handle = None
+        self._handle: Any = None
 
     def __enter__(self) -> "_FileLock":
         os.makedirs(os.path.dirname(os.path.abspath(self.path)), exist_ok=True)
@@ -383,7 +382,7 @@ class _FileLock:
         if os.name == "nt":
             import msvcrt
 
-            msvcrt.locking(self._handle.fileno(), msvcrt.LK_LOCK, 1)
+            getattr(msvcrt, "locking")(self._handle.fileno(), getattr(msvcrt, "LK_LOCK"), 1)
         else:
             import fcntl
 
@@ -396,7 +395,7 @@ class _FileLock:
         if os.name == "nt":
             import msvcrt
 
-            msvcrt.locking(self._handle.fileno(), msvcrt.LK_UNLCK, 1)
+            getattr(msvcrt, "locking")(self._handle.fileno(), getattr(msvcrt, "LK_UNLCK"), 1)
         else:
             import fcntl
 

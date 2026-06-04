@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import asdict, is_dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from autosolver_agent.models import Candidate, IterationArtifact, ScoreResult, ValidationResult
 
@@ -56,7 +56,7 @@ class ArtifactStore:
         write_json(artifact.impact_path, impact)
 
     def disk_results(self, limit: int = 20) -> List[Dict[str, Any]]:
-        results = []
+        results: List[Dict[str, Any]] = []
         if not os.path.isdir(self.artifact_dir):
             return results
         for root, _, files in os.walk(self.artifact_dir):
@@ -79,8 +79,8 @@ class ArtifactStore:
 
 
 def serialize(value: Any) -> Any:
-    if is_dataclass(value):
-        return asdict(value)
+    if is_dataclass(value) and not isinstance(value, type):
+        return asdict(value)  # type: ignore[arg-type]
     if isinstance(value, tuple):
         return list(value)
     if isinstance(value, list):

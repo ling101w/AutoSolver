@@ -5,65 +5,175 @@ from __future__ import annotations
 import os
 import statistics
 from collections import defaultdict
-from typing import Any, Dict, Iterable, List
+from typing import Any, DefaultDict, Dict, Iterable, List, Optional, Set, Tuple
 
-from autosolver_agent.models import Case, ParsedCase
+from autosolver_agent.models import Case, ParsedCase, ParseDiagnostic
+
+
+class CaseParseError(RuntimeError):
+    """Raised when strict case parsing encounters diagnostics."""
+
+    def __init__(self, diagnostics: List[ParseDiagnostic]) -> None:
+        self.diagnostics = diagnostics
+        summary = "; ".join(item.message for item in diagnostics[:3])
+        if len(diagnostics) > 3:
+            summary += f"; and {len(diagnostics) - 3} more"
+        super().__init__(summary or "case parse failed")
 
 
 def parse_case(text: str) -> ParsedCase:
-    rows = []
-    by_key = defaultdict(dict)
-    key_tasks = {}
-    for line in text.strip().splitlines():
-        line = line.strip()
-        if not line or line.startswith("task_id_list"):
+    parsed, _ = parse_case_with_diagnostics(text)
+    return parsed
+
+
+def parse_case_with_diagnostics(
+    text: str,
+    *,
+    case_name: Optional[str] = None,
+    path: Optional[str] = None,
+    strict: bool = False,
+) -> Tuple[ParsedCase, List[ParseDiagnostic]]:
+    rows: List[Tuple[Tuple[str, ...], str, str, float, float]] = []
+    by_key: DefaultDict[str, Dict[str, Tuple[float, float]]] = defaultdict(dict)
+    key_tasks: Dict[str, Tuple[str, ...]] = {}
+    diagnostics: List[ParseDiagnostic] = []
+    for line_number, raw_line in enumerate(text.strip().splitlines(), start=1):
+        stripped = raw_line.strip()
+        if not stripped:
             continue
-        parts = line.split("\t")
+        if stripped.startswith("task_id_list"):
+            continue
+        parts = raw_line.rstrip("\r\n").split("\t")
         if len(parts) < 4:
+            diagnostics.append(
+                _diagnostic(
+                    "malformed_row",
+                    "row has fewer than 4 tab-separated fields",
+                    path=path,
+                    case_name=case_name,
+                    line_number=line_number,
+                    raw_line=raw_line,
+                )
+            )
             continue
         raw_key, courier, score, willingness = parts[:4]
+        tasks = tuple(t.strip() for t in raw_key.split(",") if t.strip())
+        if not tasks:
+            diagnostics.append(
+                _diagnostic(
+                    "empty_task_key",
+                    "task_id_list is empty",
+                    path=path,
+                    case_name=case_name,
+                    line_number=line_number,
+                    raw_line=raw_line,
+                )
+            )
+            continue
+        task_key = ",".join(tasks)
+        courier = courier.strip()
+        if not courier:
+            diagnostics.append(
+                _diagnostic(
+                    "empty_courier",
+                    "courier_id is empty",
+                    path=path,
+                    case_name=case_name,
+                    line_number=line_number,
+                    raw_line=raw_line,
+                )
+            )
+            continue
         try:
-            tasks = tuple(t.strip() for t in raw_key.split(",") if t.strip())
-            if not tasks:
-                continue
-            task_key = ",".join(tasks)
-            courier = courier.strip()
             score_value = float(score)
             willingness_value = float(willingness)
-        except Exception:
+        except ValueError:
+            diagnostics.append(
+                _diagnostic(
+                    "bad_numeric_value",
+                    "total_score or willingness is not numeric",
+                    path=path,
+                    case_name=case_name,
+                    line_number=line_number,
+                    raw_line=raw_line,
+                )
+            )
             continue
         rows.append((tasks, task_key, courier, score_value, willingness_value))
         by_key[task_key][courier] = (score_value, willingness_value)
         key_tasks[task_key] = tasks
     all_tasks = sorted({t for tasks, _, _, _, _ in rows for t in tasks})
     all_couriers = sorted({c for _, _, c, _, _ in rows})
-    return ParsedCase(
+    parsed = ParsedCase(
         rows=rows,
         by_key=dict(by_key),
         key_tasks=key_tasks,
         all_tasks=all_tasks,
         all_couriers=all_couriers,
     )
+    if strict and diagnostics:
+        raise CaseParseError(diagnostics)
+    return parsed, diagnostics
 
 
 def load_cases(paths: Iterable[str], max_cases: int) -> List[Case]:
-    cases = []
+    cases, _ = load_cases_with_diagnostics(paths, max_cases)
+    return cases
+
+
+def load_cases_with_diagnostics(
+    paths: Iterable[str],
+    max_cases: int,
+    *,
+    strict: bool = False,
+) -> Tuple[List[Case], List[ParseDiagnostic]]:
+    cases: List[Case] = []
+    diagnostics: List[ParseDiagnostic] = []
     for path in paths:
         if len(cases) >= max_cases:
             break
+        abs_path = os.path.abspath(path)
         try:
             with open(path, "r", encoding="utf-8") as handle:
                 text = handle.read()
         except UnicodeDecodeError:
             with open(path, "r") as handle:
                 text = handle.read()
-        except OSError:
+        except OSError as exc:
+            diagnostics.append(
+                _diagnostic(
+                    "case_read_error",
+                    f"could not read case file: {exc}",
+                    path=abs_path,
+                    case_name=os.path.basename(path),
+                )
+            )
             continue
         lines = text.splitlines()
         if not lines or "task_id_list" not in lines[0]:
+            diagnostics.append(
+                _diagnostic(
+                    "missing_header",
+                    "case file is missing task_id_list header",
+                    path=abs_path,
+                    case_name=os.path.basename(path),
+                    line_number=1 if lines else None,
+                    raw_line=lines[0] if lines else None,
+                )
+            )
             continue
-        cases.append(Case(name=os.path.basename(path), path=os.path.abspath(path), text=text))
-    return cases
+        case = Case(name=os.path.basename(path), path=abs_path, text=text)
+        _, parse_diagnostics = parse_case_with_diagnostics(
+            text,
+            case_name=case.name,
+            path=case.path,
+            strict=False,
+        )
+        diagnostics.extend(parse_diagnostics)
+        cases.append(case)
+    if strict and diagnostics:
+        raise CaseParseError(diagnostics)
+    return cases, diagnostics
 
 
 def discover_case_paths(root: str) -> List[str]:
@@ -146,8 +256,8 @@ def penalty_for_group(parsed: ParsedCase, task_key: str, couriers: List[str]) ->
 def score_answer(parsed: ParsedCase, answer: Any) -> Dict[str, Any]:
     if not isinstance(answer, list):
         return {"valid": False, "covered": 0, "penalty": 1_000_000.0, "error": "answer is not list"}
-    used_tasks = set()
-    used_couriers = set()
+    used_tasks: Set[str] = set()
+    used_couriers: Set[str] = set()
     total = 0.0
     for item in answer:
         if not isinstance(item, (tuple, list)) or len(item) != 2:
@@ -204,3 +314,36 @@ def score_answer(parsed: ParsedCase, answer: Any) -> Dict[str, Any]:
         used_couriers.update(couriers)
     total += 100.0 * (len(parsed.all_tasks) - len(used_tasks))
     return {"valid": True, "covered": len(used_tasks), "penalty": total, "error": None}
+
+
+def diagnostics_to_dicts(diagnostics: List[ParseDiagnostic]) -> List[Dict[str, Any]]:
+    return [
+        {
+            "code": item.code,
+            "message": item.message,
+            "path": item.path,
+            "case_name": item.case_name,
+            "line_number": item.line_number,
+            "raw_line": item.raw_line,
+        }
+        for item in diagnostics
+    ]
+
+
+def _diagnostic(
+    code: str,
+    message: str,
+    *,
+    path: Optional[str] = None,
+    case_name: Optional[str] = None,
+    line_number: Optional[int] = None,
+    raw_line: Optional[str] = None,
+) -> ParseDiagnostic:
+    return ParseDiagnostic(
+        code=code,
+        message=message,
+        path=path,
+        case_name=case_name,
+        line_number=line_number,
+        raw_line=raw_line,
+    )

@@ -7,16 +7,16 @@ import textwrap
 import unittest
 
 from autosolver_agent import AutoSolverLangChainAgent
-from autosolver_agent.caseio import parse_case, score_answer
+from autosolver_agent.caseio import CaseParseError, load_cases_with_diagnostics, parse_case, parse_case_with_diagnostics, score_answer
 from autosolver_agent.llm.schema import parse_candidate_envelope
 from autosolver_agent.memory import MemoryStore
 from autosolver_agent.memory.store import MEMORY_SCHEMA_VERSION
-from autosolver_agent.models import Candidate, Case, ScoreResult
+from autosolver_agent.models import Case, ScoreResult
+from autosolver_agent.runtime import run_candidate
 from autosolver_agent.skills import SolverSkillLibrary, StrategyLibrary
 from autosolver_agent.tools import InstanceClassifier, Validator
 from langchain_autosolver_agent import build_parser
 from solvers import seed_solvers
-
 
 CASE_TEXT = """task_id_list\tcourier_id\ttotal_score\twillingness
 t0\tc0\t10\t0.8
@@ -56,10 +56,21 @@ class FakeLLM:
 
 
 def fake_candidate(name: str = "fake_solver") -> str:
+    metadata = json.dumps(
+        {
+            "name": name,
+            "idea": "bundle smoke",
+            "strategy_combination": ["bundle_first"],
+            "parameter_changes": {},
+            "expected_effect": "cover both tasks",
+            "risk_control": "simple",
+        },
+        ensure_ascii=False,
+    )
     return textwrap.dedent(
         f"""
         ```json
-        {{"name": "{name}", "idea": "bundle smoke", "strategy_combination": ["bundle_first"], "parameter_changes": {{}}, "expected_effect": "cover both tasks", "risk_control": "simple"}}
+        {metadata}
         ```
         ```python
         {VALID_SOLVER}
@@ -145,6 +156,55 @@ class ModularAgentTests(unittest.TestCase):
         result = validator.validate(duplicate, [Case("case.txt", CASE_TEXT)], [parsed])
         self.assertFalse(result.valid)
         self.assertEqual(result.errors[0]["type"], "invalid_output")
+
+    def test_sandbox_allows_safe_solver_and_rejects_escape_paths(self):
+        safe = """
+import heapq
+import math
+
+def solve(input_text: str) -> list:
+    heap = [math.sqrt(4)]
+    heapq.heapify(heap)
+    return [("t0,t1", ["c2"])] if heapq.heappop(heap) == 2 else []
+"""
+        validator = Validator(smoke_timeout=1.0)
+        self.assertTrue(validator.validate_static(safe).valid)
+        run = run_candidate(safe, CASE_TEXT, timeout=1.0)
+        self.assertEqual(run["status"], "ok")
+
+        forbidden_snippets = [
+            "def solve(input_text: str):\n    open('x', 'w')\n    return []\n",
+            "def solve(input_text: str):\n    eval('1 + 1')\n    return []\n",
+            "def solve(input_text: str):\n    exec('x = 1')\n    return []\n",
+            "def solve(input_text: str):\n    compile('1', '<x>', 'eval')\n    return []\n",
+            "def solve(input_text: str):\n    __import__('os')\n    return []\n",
+            "def solve(input_text: str):\n    globals()\n    return []\n",
+            "def solve(input_text: str):\n    return [(().__class__.__name__, [])]\n",
+        ]
+        for code in forbidden_snippets:
+            with self.subTest(code=code):
+                self.assertFalse(validator.validate_static(code).valid)
+
+    def test_sandbox_times_out_busy_loop(self):
+        code = "def solve(input_text: str):\n    while True:\n        pass\n"
+        run = run_candidate(code, CASE_TEXT, timeout=0.2)
+        self.assertEqual(run["status"], "timeout")
+
+    def test_parse_diagnostics_default_compatible_and_strict_failure(self):
+        bad_text = CASE_TEXT + "bad-row\n\ttmp\t1\t0.5\n"
+        parsed, diagnostics = parse_case_with_diagnostics(bad_text, case_name="bad.txt")
+        self.assertEqual(parsed.all_tasks, ["t0", "t1"])
+        self.assertEqual([item.code for item in diagnostics], ["malformed_row", "empty_task_key"])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "bad.txt")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(bad_text)
+            cases, file_diagnostics = load_cases_with_diagnostics([path], max_cases=1)
+            self.assertEqual(len(cases), 1)
+            self.assertEqual(len(file_diagnostics), 2)
+            with self.assertRaises(CaseParseError):
+                load_cases_with_diagnostics([path], max_cases=1, strict=True)
 
     def test_memory_json_roundtrip(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -290,6 +350,38 @@ class ModularAgentTests(unittest.TestCase):
             self.assertIn("planner_trace", loaded)
             self.assertIn("bandit", loaded)
             self.assertIn("summary", loaded)
+            self.assertIn("run_id", loaded)
+            self.assertIn("event_log_path", loaded)
+            self.assertIn("case_diagnostics", loaded)
+            self.assertIn("timings", loaded)
+            self.assertIn("candidate_hashes", loaded)
+            self.assertTrue(os.path.exists(report["event_log_path"]))
+            with open(report["event_log_path"], "r", encoding="utf-8") as handle:
+                events = [json.loads(line) for line in handle if line.strip()]
+            self.assertTrue(events)
+            self.assertTrue(all("run_id" in item and "phase" in item and "event" in item for item in events))
+
+    def test_agent_strict_cases_fails_on_parse_diagnostics(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            case_path = os.path.join(tmp, "case.txt")
+            with open(case_path, "w", encoding="utf-8") as handle:
+                handle.write(CASE_TEXT + "bad-row\n")
+            agent = AutoSolverLangChainAgent(
+                case_paths=[case_path],
+                output_path=os.path.join(tmp, "generated_submit_solution.py"),
+                budget_seconds=10,
+                per_case_timeout=2,
+                search_per_case_timeout=1,
+                iterations=1,
+                memory_dir=os.path.join(tmp, "memory"),
+                artifact_dir=os.path.join(tmp, "artifacts"),
+                llm=FakeLLM([structured_candidate("unused")]),
+                max_cases=1,
+                verbose=False,
+                strict_cases=True,
+            )
+            with self.assertRaises(CaseParseError):
+                agent.run()
 
     def test_agent_repairs_schema_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -413,12 +505,17 @@ class ModularAgentTests(unittest.TestCase):
                 "2.0",
                 "--summary-out",
                 "runs/summary.json",
+                "--strict-cases",
+                "--event-log",
+                "runs/events.jsonl",
             ]
         )
         self.assertEqual(args.max_repair_attempts, 3)
         self.assertEqual(args.memory_top_k, 7)
         self.assertEqual(args.bandit_exploration, 2.0)
         self.assertEqual(args.summary_out, "runs/summary.json")
+        self.assertTrue(args.strict_cases)
+        self.assertEqual(args.event_log, "runs/events.jsonl")
 
 
 if __name__ == "__main__":

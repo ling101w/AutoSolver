@@ -4,21 +4,38 @@ from __future__ import annotations
 
 import os
 import time
+import uuid
 from typing import Any, Dict, List, Optional, TypedDict
 
 from autosolver_agent.artifacts import ArtifactStore, serialize
+from autosolver_agent.events import code_hash, now_monotonic
 from autosolver_agent.llm import LLMCodeGenerator
 from autosolver_agent.llm.schema import SolverPlan
 from autosolver_agent.memory import MemoryStore
 from autosolver_agent.models import Candidate, Case, IterationArtifact, ParsedCase, ScoreResult, ValidationResult
 from autosolver_agent.skills import SolverSkillLibrary, StrategyLibrary
 from autosolver_agent.tools import InstanceClassifier, PlannerToolbox, Scorer, Validator
+from autosolver_agent.workflow.services import (
+    EvaluationService,
+    FinalizationService,
+    GenerationService,
+    RepairService,
+    ReportBuilder,
+    WorkflowConfig,
+    WorkflowRunState,
+    build_event_recorder,
+)
 
+LANGGRAPH_END: Any = "__end__"
+LangGraphStateGraph: Any = None
 try:
-    from langgraph.graph import END, StateGraph
+    from langgraph.graph import END as _LANGGRAPH_END
+    from langgraph.graph import StateGraph as _LANGGRAPH_STATE_GRAPH
+
+    LANGGRAPH_END = _LANGGRAPH_END
+    LangGraphStateGraph = _LANGGRAPH_STATE_GRAPH
 except Exception:  # pragma: no cover - exercised only when dependency missing
-    END = "__end__"
-    StateGraph = None
+    pass
 
 
 class WorkflowState(TypedDict, total=False):
@@ -48,6 +65,8 @@ class AutoSolverWorkflow:
         memory_top_k: int = 5,
         bandit_exploration: float = 1.4,
         summary_output_path: Optional[str] = None,
+        case_diagnostics: Optional[List[Dict[str, Any]]] = None,
+        event_log_path: Optional[str] = None,
     ) -> None:
         self.cases = cases
         self.parsed_cases = parsed_cases
@@ -65,6 +84,26 @@ class AutoSolverWorkflow:
         self.memory_top_k = max(1, memory_top_k)
         self.bandit_exploration = bandit_exploration
         self.summary_output_path = summary_output_path
+        self.config = WorkflowConfig(
+            iterations=self.iterations,
+            deadline=self.deadline,
+            per_case_timeout=self.per_case_timeout,
+            search_per_case_timeout=self.search_per_case_timeout,
+            output_path=self.output_path,
+            finalize_top_k=self.finalize_top_k,
+            max_repair_attempts=self.max_repair_attempts,
+            memory_top_k=self.memory_top_k,
+            bandit_exploration=self.bandit_exploration,
+            summary_output_path=self.summary_output_path,
+        )
+        run_id = uuid.uuid4().hex
+        resolved_event_log = event_log_path or os.path.join(self.artifacts.artifact_dir, "events.jsonl")
+        self.run_state = WorkflowRunState(
+            run_id=run_id,
+            event_log_path=os.path.abspath(resolved_event_log),
+            case_diagnostics=case_diagnostics or [],
+        )
+        self.events = build_event_recorder(self.run_state.event_log_path, run_id)
         self.classifier = InstanceClassifier()
         self.validator = Validator(smoke_timeout=min(2.0, search_per_case_timeout))
         self.scorer = Scorer(per_case_timeout=search_per_case_timeout)
@@ -85,6 +124,11 @@ class AutoSolverWorkflow:
         self.experiment_records: List[Dict[str, Any]] = []
         self.notes: List[str] = []
         self.final_solver_path: Optional[str] = None
+        self.generation_service = GenerationService(self)
+        self.evaluation_service = EvaluationService(self)
+        self.repair_service = RepairService(self)
+        self.finalization_service = FinalizationService(self)
+        self.report_builder = ReportBuilder(self)
 
     def run(self) -> Dict[str, Any]:
         graph = self._build_graph()
@@ -95,10 +139,10 @@ class AutoSolverWorkflow:
         return self.report()
 
     def _build_graph(self) -> Any:
-        if StateGraph is None:
+        if LangGraphStateGraph is None:
             self.log("langgraph unavailable; running the same workflow sequentially")
             return None
-        builder = StateGraph(WorkflowState)
+        builder = LangGraphStateGraph(WorkflowState)
         builder.add_node("classify", self._node_classify)
         builder.add_node("generate", self._node_generate)
         builder.add_node("validate_and_score", self._node_validate_and_score)
@@ -111,7 +155,7 @@ class AutoSolverWorkflow:
             lambda state: state.get("phase", "generate"),
             {"generate": "generate", "finalize": "finalize"},
         )
-        builder.add_edge("finalize", END)
+        builder.add_edge("finalize", LANGGRAPH_END)
         return builder.compile()
 
     def _run_sequential(self) -> None:
@@ -125,14 +169,44 @@ class AutoSolverWorkflow:
         state.update(self._node_finalize(state))
 
     def _node_classify(self, state: WorkflowState) -> WorkflowState:
+        return self._timed_node("classify", int(state.get("iteration", 0)), lambda: self._classify_instances(state))
+
+    def _node_generate(self, state: WorkflowState) -> WorkflowState:
+        return self._timed_node(
+            "generate",
+            int(state.get("iteration", 1)),
+            lambda: self.generation_service.generate(state),
+        )
+
+    def _node_validate_and_score(self, state: WorkflowState) -> WorkflowState:
+        return self._timed_node(
+            "validate_and_score",
+            int(state.get("iteration", 1)),
+            lambda: self.evaluation_service.validate_and_score(state),
+        )
+
+    def _node_finalize(self, state: WorkflowState) -> WorkflowState:
+        return self._timed_node(
+            "finalize",
+            int(state.get("iteration", self.iterations)),
+            lambda: self.finalization_service.finalize(state),
+        )
+
+    def _classify_instances(self, state: WorkflowState) -> WorkflowState:
         self.instance_features = self.classifier.classify(self.cases, self.parsed_cases)
         self.log(
             "classified instances: focus="
             + ",".join(self.instance_features.get("aggregate", {}).get("recommended_focus", []))
         )
+        self._record_event(
+            "instances_classified",
+            phase="classify",
+            iteration=int(state.get("iteration", 0)),
+            context={"case_count": len(self.cases), "diagnostics": len(self.run_state.case_diagnostics)},
+        )
         return {"phase": "generate", "iteration": 1}
 
-    def _node_generate(self, state: WorkflowState) -> WorkflowState:
+    def _generate_candidate(self, state: WorkflowState) -> WorkflowState:
         iteration = int(state.get("iteration", 1))
         if self._time_exhausted():
             return {"phase": "finalize", "iteration": iteration, "stop_reason": "budget exhausted before generation"}
@@ -190,7 +264,7 @@ class AutoSolverWorkflow:
         except Exception as exc:
             if self.max_repair_attempts <= 0:
                 raise
-            candidate = self._repair_schema_failure(
+            candidate = self.repair_service.repair_schema_failure(
                 iteration=iteration,
                 plan=plan,
                 error=str(exc),
@@ -200,13 +274,22 @@ class AutoSolverWorkflow:
             )
 
         self.candidates.append(candidate)
+        candidate_hash = self._remember_candidate_hash(candidate)
         artifact = self.artifacts.save_candidate(candidate)
         candidate.rationale["_artifact_validation_path"] = artifact.validation_path
         self.memory.record_candidate(iteration, candidate.name, candidate.rationale, aggregate_features)
+        self._record_event(
+            "candidate_generated",
+            phase="generate",
+            iteration=iteration,
+            candidate=candidate.name,
+            candidate_hash=candidate_hash,
+            context={"plan": plan.name, "source": candidate.source},
+        )
         self.log(f"iteration {iteration}: planned {plan.name} -> generated {candidate.name}")
         return {"phase": "validate", "iteration": iteration, "candidate": candidate, "plan": plan}
 
-    def _node_validate_and_score(self, state: WorkflowState) -> WorkflowState:
+    def _validate_and_score_candidate(self, state: WorkflowState) -> WorkflowState:
         iteration = int(state.get("iteration", 1))
         candidate = state.get("candidate")
         if candidate is None:
@@ -215,7 +298,7 @@ class AutoSolverWorkflow:
         artifact = self.artifacts.artifacts[-1]
         validation = self.validator.validate(candidate.code, self.cases, self.parsed_cases)
         if not validation.valid and self.max_repair_attempts > 0:
-            repaired = self._repair_validation_failure(iteration, state, candidate, validation)
+            repaired = self.repair_service.repair_validation_failure(iteration, state, candidate, validation)
             if repaired is not candidate:
                 candidate = repaired
                 state["candidate"] = candidate
@@ -228,6 +311,14 @@ class AutoSolverWorkflow:
             error_item = {"iteration": iteration, "candidate": candidate.name, "errors": validation.errors}
             self.validation_errors.append(error_item)
             self._record_experiment(iteration, candidate, validation=validation, artifact=artifact, failure_reason="validation failed")
+            self._record_event(
+                "validation_failed",
+                phase="validate_and_score",
+                iteration=iteration,
+                candidate=candidate.name,
+                candidate_hash=self.run_state.candidate_hashes.get(candidate.name),
+                context={"stage": validation.stage, "errors": validation.errors},
+            )
             self.log(f"iteration {iteration}: validation failed at {validation.stage}")
             return self._next_or_finalize(iteration, "validation failed")
 
@@ -245,6 +336,14 @@ class AutoSolverWorkflow:
         self.artifacts.save_impact(artifact, impact)
         self.memory.record_score(iteration, score, impact)
         self._record_experiment(iteration, candidate, score=score, validation=validation, artifact=artifact)
+        self._record_event(
+            "candidate_scored",
+            phase="validate_and_score",
+            iteration=iteration,
+            candidate=candidate.name,
+            candidate_hash=self.run_state.candidate_hashes.get(candidate.name),
+            context={"rank": list(score.rank), "covered": score.total_covered, "penalty": score.total_penalty},
+        )
         if self.best_score is None or score.rank < self.best_score.rank:
             self.best_score = score
             self.best_candidate = candidate
@@ -256,7 +355,7 @@ class AutoSolverWorkflow:
             self.log(f"iteration {iteration}: no improvement ({candidate.name})")
         return self._next_or_finalize(iteration, "iteration limit reached")
 
-    def _node_finalize(self, state: WorkflowState) -> WorkflowState:
+    def _finalize_run(self, state: WorkflowState) -> WorkflowState:
         if not self.candidates:
             raise RuntimeError("No LLM candidate was generated; cannot finalize.")
         chosen = self._finalize_recheck()
@@ -271,6 +370,14 @@ class AutoSolverWorkflow:
             from autosolver_agent.artifacts import write_json
 
             write_json(self.summary_output_path, self._summary())
+        self._record_event(
+            "solver_finalized",
+            phase="finalize",
+            iteration=int(state.get("iteration", self.iterations)),
+            candidate=self.best_candidate.name,
+            candidate_hash=self.run_state.candidate_hashes.get(self.best_candidate.name),
+            context={"output_path": output_path},
+        )
         self.log(f"finalized {self.best_candidate.name} -> {output_path}")
         return {"phase": "done", "iteration": int(state.get("iteration", self.iterations))}
 
@@ -338,8 +445,16 @@ class AutoSolverWorkflow:
         return time.time() + self.search_per_case_timeout * max(1, len(self.cases)) + 0.5 >= self.deadline
 
     def report(self) -> Dict[str, Any]:
+        return self.report_builder.build()
+
+    def _report_payload(self) -> Dict[str, Any]:
         return {
+            "run_id": self.run_state.run_id,
             "output_path": self.final_solver_path or os.path.abspath(self.output_path),
+            "event_log_path": self.run_state.event_log_path,
+            "case_diagnostics": self.run_state.case_diagnostics,
+            "timings": self.run_state.timings.timings,
+            "candidate_hashes": self.run_state.candidate_hashes,
             "cases": [case.name for case in self.cases],
             "iterations_requested": self.iterations,
             "iterations_completed": len({candidate.iteration for candidate in self.candidates}),
@@ -363,8 +478,58 @@ class AutoSolverWorkflow:
 
     def log(self, message: str) -> None:
         self.notes.append(message)
+        self._record_event("log", phase="log", message=message)
         if self.verbose:
             print(f"[agent] {message}", flush=True)
+
+    def _timed_node(self, phase: str, iteration: int, func: Any) -> WorkflowState:
+        started = now_monotonic()
+        self._record_event("phase_started", phase=phase, iteration=iteration)
+        try:
+            result = func()
+        except Exception as exc:
+            elapsed = now_monotonic() - started
+            self.run_state.timings.mark(phase, elapsed)
+            self._record_event(
+                "phase_failed",
+                phase=phase,
+                iteration=iteration,
+                elapsed=elapsed,
+                context={"error": str(exc)},
+            )
+            raise
+        elapsed = now_monotonic() - started
+        self.run_state.timings.mark(phase, elapsed)
+        self._record_event("phase_completed", phase=phase, iteration=iteration, elapsed=elapsed)
+        return result
+
+    def _record_event(
+        self,
+        event: str,
+        *,
+        phase: str,
+        iteration: Optional[int] = None,
+        message: str = "",
+        candidate: Optional[str] = None,
+        candidate_hash: Optional[str] = None,
+        elapsed: Optional[float] = None,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        self.events.record(
+            event,
+            phase=phase,
+            iteration=iteration,
+            message=message,
+            candidate=candidate,
+            candidate_hash=candidate_hash,
+            elapsed=elapsed,
+            context=context,
+        )
+
+    def _remember_candidate_hash(self, candidate: Candidate) -> str:
+        value = code_hash(candidate.code)
+        self.run_state.candidate_hashes[candidate.name] = value
+        return value
 
     def _repair_schema_failure(
         self,
@@ -399,6 +564,12 @@ class AutoSolverWorkflow:
                 last_error = str(exc)
                 self.repair_history.append(
                     {"iteration": iteration, "attempt": attempt, "reason": "schema_error", "error": last_error}
+                )
+                self._record_event(
+                    "repair_failed",
+                    phase="generate",
+                    iteration=iteration,
+                    context={"attempt": attempt, "reason": "schema_error", "error": last_error},
                 )
         raise RuntimeError(f"LLM structured generation failed after repair attempts: {last_error}")
 
@@ -448,8 +619,17 @@ class AutoSolverWorkflow:
                         "error": str(exc),
                     }
                 )
+                self._record_event(
+                    "repair_failed",
+                    phase="validate_and_score",
+                    iteration=iteration,
+                    candidate=current.name,
+                    candidate_hash=self.run_state.candidate_hashes.get(current.name),
+                    context={"attempt": attempt, "reason": "validation_error", "error": str(exc)},
+                )
                 continue
             self.candidates.append(repaired)
+            repaired_hash = self._remember_candidate_hash(repaired)
             artifact = self.artifacts.save_candidate(repaired)
             repaired.rationale["_artifact_validation_path"] = artifact.validation_path
             self.memory.record_candidate(iteration, repaired.name, repaired.rationale, aggregate_features)
@@ -462,6 +642,14 @@ class AutoSolverWorkflow:
                     "candidate": repaired.name,
                     "errors": current_validation.errors,
                 }
+            )
+            self._record_event(
+                "candidate_repaired",
+                phase="validate_and_score",
+                iteration=iteration,
+                candidate=repaired.name,
+                candidate_hash=repaired_hash,
+                context={"attempt": attempt, "from": current.name},
             )
             current_validation = self.validator.validate(repaired.code, self.cases, self.parsed_cases)
             if current_validation.valid:

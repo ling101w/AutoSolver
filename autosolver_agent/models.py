@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-
 Rank = Tuple[int, int, float, float]
 
 
@@ -14,6 +13,16 @@ class Case:
     name: str
     text: str
     path: Optional[str] = None
+
+
+@dataclass
+class ParseDiagnostic:
+    code: str
+    message: str
+    path: Optional[str] = None
+    case_name: Optional[str] = None
+    line_number: Optional[int] = None
+    raw_line: Optional[str] = None
 
 
 @dataclass
