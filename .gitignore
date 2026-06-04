@@ -3,3 +3,6 @@ venv/
 env/
 __pycache__/
 *.py[cod]
+runs/
+.coverage
+*.egg-info/
