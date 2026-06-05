@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 from typing import Any, Dict, List, Optional
 
 from autosolver_agent.llm.schema import (
@@ -41,14 +40,19 @@ class LLMCodeGenerator:
         self.last_planner_trace: List[Dict[str, Any]] = []
         self.last_tool_calls: List[Dict[str, Any]] = []
 
-    def _build_langchain_llm(self) -> Any:
-        api_key = os.environ.get("OPENAI_API_KEY") or os.environ.get("OPENAI_KEY")
-        if not api_key:
+    @staticmethod
+    def validate_environment() -> None:
+        if not (os.environ.get("OPENAI_API_KEY") or os.environ.get("OPENAI_KEY")):
             raise RuntimeError("LLM code generation requires OPENAI_API_KEY or OPENAI_KEY.")
         try:
-            from langchain_openai import ChatOpenAI
+            from langchain_openai import ChatOpenAI  # noqa: F401
         except Exception as exc:
             raise RuntimeError("LLM code generation requires langchain-openai. Install requirements.txt.") from exc
+
+    def _build_langchain_llm(self) -> Any:
+        self.validate_environment()
+        from langchain_openai import ChatOpenAI
+
         kwargs: Dict[str, Any] = {"model": self.model, "temperature": self.temperature}
         if self.base_url:
             kwargs["base_url"] = self.base_url
@@ -71,19 +75,12 @@ class LLMCodeGenerator:
     ) -> SolverPlan:
         """Produce a SolverPlan, using LangChain tools when the LLM supports them."""
 
-        fallback_context = toolbox.snapshot() if toolbox is not None else {}
         if not hasattr(self.llm, "bind_tools") or toolbox is None:
-            plan = self._fallback_plan(iteration, instance_features, memory_digest)
-            self.last_planner_trace = [{"mode": "fallback", "plan": model_dump(plan), "tool_context": fallback_context}]
-            self.last_tool_calls = []
-            return plan
+            raise RuntimeError("Planning requires an LLM with bind_tools support and a PlannerToolbox.")
 
         tools = build_langchain_tools(toolbox)
         if not tools:
-            plan = self._fallback_plan(iteration, instance_features, memory_digest)
-            self.last_planner_trace = [{"mode": "fallback_no_tools", "plan": model_dump(plan), "tool_context": fallback_context}]
-            self.last_tool_calls = []
-            return plan
+            raise RuntimeError("Planning requires LangChain planner tools; build_langchain_tools returned no tools.")
 
         system = (
             "You are the planning controller for AutoSolver Agent. Use tools to inspect instance features, "
@@ -100,47 +97,30 @@ class LLMCodeGenerator:
         messages: List[Any] = [("system", system), ("human", user)]
         trace: List[Dict[str, Any]] = []
         content = ""
-        try:
-            tool_llm = self.llm.bind_tools(tools)
-            tool_by_name = {getattr(tool, "name", ""): tool for tool in tools}
-            for _ in range(4):
-                response = tool_llm.invoke(messages)
-                tool_calls = list(getattr(response, "tool_calls", []) or [])
-                if not tool_calls:
-                    content = self._content(response)
-                    break
-                messages.append(response)
-                for call in tool_calls:
-                    name = call.get("name")
-                    args = call.get("args") or {}
-                    tool = tool_by_name.get(name)
-                    result = tool.invoke(args) if tool is not None else f"unknown tool: {name}"
-                    trace.append({"tool": name, "args": args, "result": result})
-                    messages.append(_tool_message(str(result), call.get("id"), name))
-            if not content:
-                response = self.llm.invoke(
-                    [
-                        ("system", system),
-                        ("human", "Tool context:\n" + _json(fallback_context) + "\nReturn SolverPlan JSON only."),
-                    ]
-                )
+        tool_llm = self.llm.bind_tools(tools)
+        tool_by_name = {getattr(tool, "name", ""): tool for tool in tools}
+        for _ in range(4):
+            response = tool_llm.invoke(messages)
+            tool_calls = list(getattr(response, "tool_calls", []) or [])
+            if not tool_calls:
                 content = self._content(response)
-            plan = parse_solver_plan(content)
-            self.last_planner_trace = [{"mode": "tool_calling", "raw_response": content, "plan": model_dump(plan)}]
-            self.last_tool_calls = trace or toolbox.trace
-            return plan
-        except Exception as exc:
-            plan = self._fallback_plan(iteration, instance_features, memory_digest)
-            self.last_planner_trace = [
-                {
-                    "mode": "fallback_after_error",
-                    "error": str(exc),
-                    "plan": model_dump(plan),
-                    "tool_context": fallback_context,
-                }
-            ]
-            self.last_tool_calls = trace or toolbox.trace
-            return plan
+                break
+            messages.append(response)
+            for call in tool_calls:
+                name = call.get("name")
+                args = call.get("args") or {}
+                tool = tool_by_name.get(name)
+                if tool is None:
+                    raise RuntimeError(f"Planning LLM requested unknown tool: {name}")
+                result = tool.invoke(args)
+                trace.append({"tool": name, "args": args, "result": result})
+                messages.append(_tool_message(str(result), call.get("id"), name))
+        if not content:
+            raise RuntimeError("Planning LLM exhausted tool-call budget without returning SolverPlan JSON.")
+        plan = parse_solver_plan(content)
+        self.last_planner_trace = [{"mode": "tool_calling", "raw_response": content, "plan": model_dump(plan)}]
+        self.last_tool_calls = trace or toolbox.trace
+        return plan
 
     def generate_from_plan(
         self,
@@ -264,33 +244,6 @@ class LLMCodeGenerator:
             source="llm_repair",
         )
 
-    def generate(
-        self,
-        iteration: int,
-        instance_features: Dict[str, Any],
-        strategy_context: str,
-        solver_context: str,
-        memory_digest: Dict[str, Any],
-        disk_results: List[Dict[str, Any]],
-        previous_impact: List[Dict[str, Any]],
-        case_samples: List[str],
-        per_case_timeout: float,
-    ) -> Candidate:
-        """Compatibility wrapper for the previous generator API."""
-
-        plan = self._fallback_plan(iteration, instance_features.get("aggregate", instance_features), memory_digest)
-        return self.generate_from_plan(
-            iteration=iteration,
-            plan=plan,
-            instance_features=instance_features,
-            solver_context=solver_context,
-            memory_digest=memory_digest,
-            disk_results=disk_results,
-            previous_impact=previous_impact,
-            case_samples=case_samples,
-            per_case_timeout=per_case_timeout,
-        )
-
     def _invoke(self, system: str, user: str) -> str:
         response = self.llm.invoke([("system", system), ("human", user)])
         return self._content(response)
@@ -307,54 +260,12 @@ class LLMCodeGenerator:
             return "\n".join(part for part in parts if part)
         return str(content)
 
-    def _fallback_plan(self, iteration: int, features: Dict[str, Any], memory_digest: Dict[str, Any]) -> SolverPlan:
-        aggregate = features.get("aggregate", features)
-        focus = aggregate.get("recommended_focus", []) or aggregate.get("tags", [])
-        bandit = memory_digest.get("bandit_recommendations", [])
-        if bandit:
-            focus = [item.get("arm") for item in bandit if item.get("arm")] + list(focus)
-        strategies = [str(item) for item in focus if item]
-        return SolverPlan(
-            name=f"autosolver_plan_{iteration:03d}",
-            strategy_combination=list(dict.fromkeys(strategies))[:5] or ["expected_greedy", "local_search_repair"],
-            parameter_changes={},
-            exploration_mode="balanced",
-            reasoning="Fallback plan built from classified features, memory digest, and bandit recommendations.",
-            risk_control="Generate standard-library solve() and rely on validator/scorer repair loop.",
-            generation_directives=[
-                "Prefer valid disjoint assignments before penalty optimization.",
-                "Use internal time checks below the judge timeout.",
-                "Repair uncovered tasks after any bundle-first construction.",
-            ],
-        )
+def sanitize_name(value: Any, default_name: str) -> str:
+    import re
 
-
-def extract_python_code(text: str) -> str:
-    blocks = re.findall(r"```(?:python|py)\s*(.*?)```", text, flags=re.IGNORECASE | re.DOTALL)
-    if blocks:
-        return blocks[-1].strip()
-    if "def solve" in text:
-        return text[text.index("def solve") :].strip()
-    return ""
-
-
-def extract_json_block(text: str) -> Dict[str, Any]:
-    blocks = re.findall(r"```json\s*(.*?)```", text, flags=re.IGNORECASE | re.DOTALL)
-    candidates = blocks or re.findall(r"(\{.*?\})", text, flags=re.DOTALL)
-    for raw in candidates:
-        try:
-            value = json.loads(raw)
-        except Exception:
-            continue
-        if isinstance(value, dict):
-            return value
-    return {}
-
-
-def sanitize_name(value: Any, fallback: str) -> str:
-    raw = str(value or fallback)
+    raw = str(value or default_name)
     name = re.sub(r"[^A-Za-z0-9_.-]+", "_", raw).strip("._-")
-    return (name or fallback)[:80]
+    return (name or default_name)[:80]
 
 
 def _json(value: Any) -> str:
@@ -362,12 +273,9 @@ def _json(value: Any) -> str:
 
 
 def _tool_message(content: str, tool_call_id: Optional[str], name: Optional[str]) -> Any:
-    try:
-        from langchain_core.messages import ToolMessage
+    from langchain_core.messages import ToolMessage
 
-        return ToolMessage(content=content, tool_call_id=tool_call_id or name or "tool")
-    except Exception:
-        return ("tool", content)
+    return ToolMessage(content=content, tool_call_id=tool_call_id or name or "tool")
 
 
 def _env_bool(name: str) -> bool:

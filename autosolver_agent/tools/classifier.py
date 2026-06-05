@@ -157,8 +157,8 @@ class InstanceClassifier:
         }
 
 
-def _first_tag(tags: set, candidates: List[str], fallback: str) -> str:
+def _first_tag(tags: set, candidates: List[str], default_tag: str) -> str:
     for candidate in candidates:
         if candidate in tags:
             return candidate
-    return fallback
+    return default_tag

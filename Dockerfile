@@ -16,7 +16,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-COPY pyproject.toml requirements.txt README_langchain_agent.md langchain_autosolver_agent.py ./
+COPY pyproject.toml requirements.txt README_langchain_agent.md ./
 COPY autosolver_agent ./autosolver_agent
 COPY solvers ./solvers
 COPY examples ./examples

@@ -1,4 +1,4 @@
-"""LangChain-compatible planner tools for the AutoSolver Agent."""
+"""LangChain planner tools for the AutoSolver Agent."""
 
 from __future__ import annotations
 
@@ -73,12 +73,9 @@ class PlannerToolbox:
 
 
 def build_langchain_tools(toolbox: PlannerToolbox) -> List[Any]:
-    """Build StructuredTool objects when LangChain Core is installed."""
+    """Build StructuredTool objects for planner tool calls."""
 
-    try:
-        from langchain_core.tools import StructuredTool
-    except Exception:
-        return []
+    from langchain_core.tools import StructuredTool
 
     def make_tool(name: str, description: str, func: Callable[..., str]) -> Any:
         return StructuredTool.from_function(func=func, name=name, description=description)

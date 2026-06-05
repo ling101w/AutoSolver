@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 from autosolver_agent.events import EventRecorder, PhaseTimer
 from autosolver_agent.models import Candidate
@@ -15,6 +15,7 @@ class WorkflowConfig:
     deadline: float
     per_case_timeout: float
     search_per_case_timeout: float
+    strategy_workers: int
     output_path: str
     finalize_top_k: int
     max_repair_attempts: int
@@ -27,7 +28,6 @@ class WorkflowConfig:
 class WorkflowRunState:
     run_id: str
     event_log_path: str
-    case_diagnostics: List[Dict[str, Any]] = field(default_factory=list)
     timings: PhaseTimer = field(default_factory=PhaseTimer)
     candidate_hashes: Dict[str, str] = field(default_factory=dict)
 

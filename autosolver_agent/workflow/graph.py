@@ -5,11 +5,16 @@ from __future__ import annotations
 import os
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional, TypedDict
+
+from langgraph.graph import END as LANGGRAPH_END
+from langgraph.graph import StateGraph as LangGraphStateGraph
 
 from autosolver_agent.artifacts import ArtifactStore, serialize
 from autosolver_agent.events import code_hash, now_monotonic
 from autosolver_agent.llm import LLMCodeGenerator
+from autosolver_agent.llm.generator import sanitize_name
 from autosolver_agent.llm.schema import SolverPlan
 from autosolver_agent.memory import MemoryStore
 from autosolver_agent.models import Candidate, Case, IterationArtifact, ParsedCase, ScoreResult, ValidationResult
@@ -26,24 +31,22 @@ from autosolver_agent.workflow.services import (
     build_event_recorder,
 )
 
-LANGGRAPH_END: Any = "__end__"
-LangGraphStateGraph: Any = None
-try:
-    from langgraph.graph import END as _LANGGRAPH_END
-    from langgraph.graph import StateGraph as _LANGGRAPH_STATE_GRAPH
-
-    LANGGRAPH_END = _LANGGRAPH_END
-    LangGraphStateGraph = _LANGGRAPH_STATE_GRAPH
-except Exception:  # pragma: no cover - exercised only when dependency missing
-    pass
-
 
 class WorkflowState(TypedDict, total=False):
     phase: str
     iteration: int
     candidate: Candidate
+    candidates: List[Candidate]
     plan: SolverPlan
+    plans: List[SolverPlan]
     stop_reason: str
+
+
+class CandidateEvaluationItem(TypedDict):
+    candidate: Candidate
+    validation: ValidationResult
+    score: Optional[ScoreResult]
+    impact: Optional[Dict[str, Any]]
 
 
 class AutoSolverWorkflow:
@@ -64,8 +67,8 @@ class AutoSolverWorkflow:
         max_repair_attempts: int = 2,
         memory_top_k: int = 5,
         bandit_exploration: float = 1.4,
+        strategy_workers: int = 1,
         summary_output_path: Optional[str] = None,
-        case_diagnostics: Optional[List[Dict[str, Any]]] = None,
         event_log_path: Optional[str] = None,
     ) -> None:
         self.cases = cases
@@ -83,12 +86,15 @@ class AutoSolverWorkflow:
         self.max_repair_attempts = max(0, max_repair_attempts)
         self.memory_top_k = max(1, memory_top_k)
         self.bandit_exploration = bandit_exploration
+        self.strategy_workers = max(1, int(strategy_workers or 1))
+        self.iteration_stride = 1
         self.summary_output_path = summary_output_path
         self.config = WorkflowConfig(
             iterations=self.iterations,
             deadline=self.deadline,
             per_case_timeout=self.per_case_timeout,
             search_per_case_timeout=self.search_per_case_timeout,
+            strategy_workers=self.strategy_workers,
             output_path=self.output_path,
             finalize_top_k=self.finalize_top_k,
             max_repair_attempts=self.max_repair_attempts,
@@ -101,7 +107,6 @@ class AutoSolverWorkflow:
         self.run_state = WorkflowRunState(
             run_id=run_id,
             event_log_path=os.path.abspath(resolved_event_log),
-            case_diagnostics=case_diagnostics or [],
         )
         self.events = build_event_recorder(self.run_state.event_log_path, run_id)
         self.classifier = InstanceClassifier()
@@ -113,6 +118,7 @@ class AutoSolverWorkflow:
         self.best_candidate: Optional[Candidate] = None
         self.best_score: Optional[ScoreResult] = None
         self.candidates: List[Candidate] = []
+        self.candidate_artifacts: Dict[str, IterationArtifact] = {}
         self.scores: List[ScoreResult] = []
         self.validation_errors: List[Dict[str, Any]] = []
         self.impact_analysis: List[Dict[str, Any]] = []
@@ -132,16 +138,33 @@ class AutoSolverWorkflow:
 
     def run(self) -> Dict[str, Any]:
         graph = self._build_graph()
-        if graph is not None:
-            graph.invoke({"phase": "classify", "iteration": 0})
-        else:
-            self._run_sequential()
+        graph.invoke({"phase": "classify", "iteration": 0})
+        return self.report()
+
+    def run_worker_loop(
+        self,
+        worker_id: int = 0,
+        first_iteration: int = 1,
+        iteration_counter: Any = None,
+        iteration_lock: Any = None,
+        max_iterations: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        self.iteration_stride = 1
+        self._record_event("worker_started", phase="worker", iteration=first_iteration, context={"worker_id": worker_id})
+        state: WorkflowState = self._prepare_worker_loop(first_iteration)
+        while True:
+            state.update(self._node_generate(state))
+            state.update(self._node_validate_and_score(state))
+            if state.get("phase") == "finalize":
+                break
+            claimed = _claim_worker_iteration(iteration_counter, iteration_lock, max_iterations, self.deadline)
+            if claimed is None:
+                state = {"phase": "finalize", "iteration": int(state.get("iteration", first_iteration)), "stop_reason": "global iteration limit reached"}
+                break
+            state = {"phase": "generate", "iteration": claimed}
         return self.report()
 
     def _build_graph(self) -> Any:
-        if LangGraphStateGraph is None:
-            self.log("langgraph unavailable; running the same workflow sequentially")
-            return None
         builder = LangGraphStateGraph(WorkflowState)
         builder.add_node("classify", self._node_classify)
         builder.add_node("generate", self._node_generate)
@@ -158,15 +181,10 @@ class AutoSolverWorkflow:
         builder.add_edge("finalize", LANGGRAPH_END)
         return builder.compile()
 
-    def _run_sequential(self) -> None:
+    def _prepare_worker_loop(self, start_iteration: int) -> WorkflowState:
         state: WorkflowState = {"phase": "classify", "iteration": 0}
         state.update(self._node_classify(state))
-        while True:
-            state.update(self._node_generate(state))
-            state.update(self._node_validate_and_score(state))
-            if state.get("phase") == "finalize":
-                break
-        state.update(self._node_finalize(state))
+        return {"phase": "generate", "iteration": max(1, int(start_iteration))}
 
     def _node_classify(self, state: WorkflowState) -> WorkflowState:
         return self._timed_node("classify", int(state.get("iteration", 0)), lambda: self._classify_instances(state))
@@ -202,7 +220,7 @@ class AutoSolverWorkflow:
             "instances_classified",
             phase="classify",
             iteration=int(state.get("iteration", 0)),
-            context={"case_count": len(self.cases), "diagnostics": len(self.run_state.case_diagnostics)},
+            context={"case_count": len(self.cases)},
         )
         return {"phase": "generate", "iteration": 1}
 
@@ -248,112 +266,311 @@ class AutoSolverWorkflow:
         )
         self.bandit_trace.append({"iteration": iteration, "recommendations": tool_context.get("bandit_recommendations", [])})
 
-        try:
-            candidate = self.llm.generate_from_plan(
-                iteration=iteration,
-                plan=plan,
-                instance_features=self.instance_features,
-                solver_context=solver_context,
-                memory_digest=memory_digest,
-                disk_results=self.artifacts.disk_results(),
-                previous_impact=self.impact_analysis,
-                case_samples=self._case_samples(),
-                per_case_timeout=self.per_case_timeout,
-                tool_context=tool_context,
-            )
-        except Exception as exc:
-            if self.max_repair_attempts <= 0:
-                raise
-            candidate = self.repair_service.repair_schema_failure(
-                iteration=iteration,
-                plan=plan,
-                error=str(exc),
-                raw_response=getattr(exc, "raw_response", ""),
-                memory_digest=memory_digest,
-                best_summary=best_summary,
-            )
-
-        self.candidates.append(candidate)
-        candidate_hash = self._remember_candidate_hash(candidate)
-        artifact = self.artifacts.save_candidate(candidate)
-        candidate.rationale["_artifact_validation_path"] = artifact.validation_path
-        self.memory.record_candidate(iteration, candidate.name, candidate.rationale, aggregate_features)
-        self._record_event(
-            "candidate_generated",
-            phase="generate",
+        plans = self._strategy_plan_batch(plan, aggregate_features, memory_digest, tool_context)
+        generated = self._generate_candidates_from_plans(
             iteration=iteration,
-            candidate=candidate.name,
-            candidate_hash=candidate_hash,
-            context={"plan": plan.name, "source": candidate.source},
+            plans=plans,
+            solver_context=solver_context,
+            memory_digest=memory_digest,
+            tool_context=tool_context,
+            best_summary=best_summary,
         )
-        self.log(f"iteration {iteration}: planned {plan.name} -> generated {candidate.name}")
-        return {"phase": "validate", "iteration": iteration, "candidate": candidate, "plan": plan}
+        candidates: List[Candidate] = []
+        used_names = set(self.run_state.candidate_hashes)
+        for index, variant_plan, candidate in generated:
+            self._normalize_candidate_name(candidate, iteration, index, variant_plan, used_names)
+            self.candidates.append(candidate)
+            candidate_hash = self._remember_candidate_hash(candidate)
+            artifact = self.artifacts.save_candidate(candidate)
+            self._remember_candidate_artifact(candidate, artifact)
+            candidate.rationale["_artifact_validation_path"] = artifact.validation_path
+            self.memory.record_candidate(iteration, candidate.name, candidate.rationale, aggregate_features)
+            self._record_event(
+                "candidate_generated",
+                phase="generate",
+                iteration=iteration,
+                candidate=candidate.name,
+                candidate_hash=candidate_hash,
+                context={
+                    "plan": variant_plan.name,
+                    "source": candidate.source,
+                    "strategy_combination": list(variant_plan.strategy_combination),
+                    "strategy_batch_size": len(plans),
+                },
+            )
+            candidates.append(candidate)
+
+        if len(candidates) == 1:
+            self.log(f"iteration {iteration}: planned {plans[0].name} -> generated {candidates[0].name}")
+        else:
+            self.log(
+                f"iteration {iteration}: generated {len(candidates)} strategy candidates "
+                f"with {self._strategy_worker_count(len(candidates))} strategy workers"
+            )
+        return {
+            "phase": "validate",
+            "iteration": iteration,
+            "candidate": candidates[0],
+            "candidates": candidates,
+            "plan": plans[0],
+            "plans": plans,
+        }
+
+    def _generate_candidates_from_plans(
+        self,
+        *,
+        iteration: int,
+        plans: List[SolverPlan],
+        solver_context: str,
+        memory_digest: Dict[str, Any],
+        tool_context: Dict[str, Any],
+        best_summary: Dict[str, Any],
+    ) -> List[tuple[int, SolverPlan, Candidate]]:
+        disk_results = self.artifacts.disk_results()
+        previous_impact = list(self.impact_analysis)
+        case_samples = self._case_samples()
+
+        def generate_one(item: tuple[int, SolverPlan]) -> tuple[int, SolverPlan, Candidate]:
+            index, variant_plan = item
+            try:
+                candidate = self.llm.generate_from_plan(
+                    iteration=iteration,
+                    plan=variant_plan,
+                    instance_features=self.instance_features,
+                    solver_context=solver_context,
+                    memory_digest=memory_digest,
+                    disk_results=disk_results,
+                    previous_impact=previous_impact,
+                    case_samples=case_samples,
+                    per_case_timeout=self.per_case_timeout,
+                    tool_context=tool_context,
+                )
+            except Exception as exc:
+                if self.max_repair_attempts <= 0:
+                    raise
+                candidate = self.repair_service.repair_schema_failure(
+                    iteration=iteration,
+                    plan=variant_plan,
+                    error=str(exc),
+                    raw_response=getattr(exc, "raw_response", ""),
+                    memory_digest=memory_digest,
+                    best_summary=best_summary,
+                )
+            return index, variant_plan, candidate
+
+        indexed_plans = list(enumerate(plans, start=1))
+        if len(indexed_plans) == 1:
+            return [generate_one(indexed_plans[0])]
+        with ThreadPoolExecutor(max_workers=self._strategy_worker_count(len(indexed_plans))) as executor:
+            return list(executor.map(generate_one, indexed_plans))
 
     def _validate_and_score_candidate(self, state: WorkflowState) -> WorkflowState:
         iteration = int(state.get("iteration", 1))
-        candidate = state.get("candidate")
-        if candidate is None:
+        candidates = list(state.get("candidates") or ([state["candidate"]] if state.get("candidate") is not None else []))
+        if not candidates:
             return {"phase": "finalize", "iteration": iteration, "stop_reason": "missing candidate"}
 
-        artifact = self.artifacts.artifacts[-1]
-        validation = self.validator.validate(candidate.code, self.cases, self.parsed_cases)
-        if not validation.valid and self.max_repair_attempts > 0:
-            repaired = self.repair_service.repair_validation_failure(iteration, state, candidate, validation)
-            if repaired is not candidate:
-                candidate = repaired
-                state["candidate"] = candidate
-                artifact = self.artifacts.artifacts[-1]
-                validation = self.validator.validate(candidate.code, self.cases, self.parsed_cases)
+        validations = self._validate_candidates(candidates)
+        final_items: List[CandidateEvaluationItem] = []
+        for candidate, validation in zip(candidates, validations):
+            if not validation.valid and self.max_repair_attempts > 0:
+                repaired = self.repair_service.repair_validation_failure(iteration, state, candidate, validation)
+                if repaired is not candidate:
+                    candidate = repaired
+                    validation = self.validator.validate(candidate.code, self.cases, self.parsed_cases)
+            final_items.append({"candidate": candidate, "validation": validation, "score": None, "impact": None})
 
-        self.artifacts.save_validation(artifact, validation)
-        self.memory.record_validation(iteration, validation)
-        if not validation.valid:
-            error_item = {"iteration": iteration, "candidate": candidate.name, "errors": validation.errors}
-            self.validation_errors.append(error_item)
-            self._record_experiment(iteration, candidate, validation=validation, artifact=artifact, failure_reason="validation failed")
+        valid_items = [item for item in final_items if item["validation"].valid]
+        if valid_items:
+            scores = self._score_candidate_batch(
+                [item["candidate"] for item in valid_items],
+                best=self.best_score,
+            )
+            for item, score in zip(valid_items, scores):
+                item["score"] = score
+                item["impact"] = self._impact(item["candidate"], score)
+
+        valid_count = 0
+        for item in final_items:
+            candidate = item["candidate"]
+            validation = item["validation"]
+            artifact = self.candidate_artifacts.get(candidate.name)
+            if artifact is None:
+                artifact = self.artifacts.save_candidate(candidate)
+                self._remember_candidate_artifact(candidate, artifact)
+            self.artifacts.save_validation(artifact, validation)
+            self.memory.record_validation(iteration, validation)
+            if not validation.valid:
+                error_item = {"iteration": iteration, "candidate": candidate.name, "errors": validation.errors}
+                self.validation_errors.append(error_item)
+                self._record_experiment(
+                    iteration,
+                    candidate,
+                    validation=validation,
+                    artifact=artifact,
+                    failure_reason="validation failed",
+                )
+                self._record_event(
+                    "validation_failed",
+                    phase="validate_and_score",
+                    iteration=iteration,
+                    candidate=candidate.name,
+                    candidate_hash=self.run_state.candidate_hashes.get(candidate.name),
+                    context={"stage": validation.stage, "errors": validation.errors},
+                )
+                self.log(f"iteration {iteration}: validation failed for {candidate.name} at {validation.stage}")
+                continue
+
+            valid_count += 1
+            score = item["score"]
+            impact = item["impact"]
+            if score is None or impact is None:
+                raise RuntimeError(f"missing score for valid candidate {candidate.name}")
+            self.scores.append(score)
+            self.artifacts.save_score(artifact, score)
+            self.impact_analysis.append(impact)
+            self.artifacts.save_impact(artifact, impact)
+            self.memory.record_score(iteration, score, impact)
+            self._record_experiment(iteration, candidate, score=score, validation=validation, artifact=artifact)
             self._record_event(
-                "validation_failed",
+                "candidate_scored",
                 phase="validate_and_score",
                 iteration=iteration,
                 candidate=candidate.name,
                 candidate_hash=self.run_state.candidate_hashes.get(candidate.name),
-                context={"stage": validation.stage, "errors": validation.errors},
+                context={"rank": list(score.rank), "covered": score.total_covered, "penalty": score.total_penalty},
             )
-            self.log(f"iteration {iteration}: validation failed at {validation.stage}")
-            return self._next_or_finalize(iteration, "validation failed")
+            if self.best_score is None or score.rank < self.best_score.rank:
+                self.best_score = score
+                self.best_candidate = candidate
+                self.log(
+                    f"iteration {iteration}: new best {candidate.name} "
+                    f"covered={score.total_covered}/{score.total_tasks} penalty={score.total_penalty:.4f}"
+                )
+            else:
+                self.log(f"iteration {iteration}: no improvement ({candidate.name})")
 
-        score = self.scorer.score(
-            candidate=candidate,
-            cases=self.cases,
-            parsed_cases=self.parsed_cases,
-            best=self.best_score,
-            timeout=self.search_per_case_timeout,
-        )
-        self.scores.append(score)
-        self.artifacts.save_score(artifact, score)
-        impact = self._impact(candidate, score)
-        self.impact_analysis.append(impact)
-        self.artifacts.save_impact(artifact, impact)
-        self.memory.record_score(iteration, score, impact)
-        self._record_experiment(iteration, candidate, score=score, validation=validation, artifact=artifact)
-        self._record_event(
-            "candidate_scored",
-            phase="validate_and_score",
-            iteration=iteration,
-            candidate=candidate.name,
-            candidate_hash=self.run_state.candidate_hashes.get(candidate.name),
-            context={"rank": list(score.rank), "covered": score.total_covered, "penalty": score.total_penalty},
-        )
-        if self.best_score is None or score.rank < self.best_score.rank:
-            self.best_score = score
-            self.best_candidate = candidate
-            self.log(
-                f"iteration {iteration}: new best {candidate.name} "
-                f"covered={score.total_covered}/{score.total_tasks} penalty={score.total_penalty:.4f}"
+        reason = "iteration limit reached" if valid_count else "validation failed"
+        return self._next_or_finalize(iteration, reason)
+
+    def _strategy_plan_batch(
+        self,
+        base_plan: SolverPlan,
+        aggregate_features: Dict[str, Any],
+        memory_digest: Dict[str, Any],
+        tool_context: Dict[str, Any],
+    ) -> List[SolverPlan]:
+        if self.strategy_workers <= 1:
+            return [base_plan]
+
+        selected = [item.name for item in self.strategy_library.select_for_features(aggregate_features)]
+        bandit = [
+            str(item.get("arm"))
+            for item in list(memory_digest.get("bandit_recommendations", []))
+            + list(tool_context.get("bandit_recommendations", []))
+            if item.get("arm")
+        ]
+        primary_names = _unique_strings(list(base_plan.strategy_combination) + bandit + selected)
+        if not primary_names:
+            return [base_plan]
+
+        plans = [base_plan]
+        for index, primary in enumerate(primary_names, start=1):
+            if len(plans) >= self.strategy_workers:
+                break
+            combo = _unique_strings([primary] + list(base_plan.strategy_combination))[:5]
+            if combo == list(base_plan.strategy_combination):
+                continue
+            directives = list(base_plan.generation_directives)
+            directives.append(f"Treat {primary} as the primary strategy for this parallel candidate.")
+            plans.append(
+                base_plan.model_copy(
+                    update={
+                        "name": sanitize_name(
+                            f"{base_plan.name}_{index:02d}_{primary}",
+                            f"parallel_plan_{index:02d}",
+                        ),
+                        "strategy_combination": combo,
+                        "exploration_mode": "parallel_strategy",
+                        "reasoning": (
+                            (base_plan.reasoning or "").strip()
+                            + f" Parallel candidate with primary focus on {primary}."
+                        ).strip(),
+                        "generation_directives": directives,
+                    }
+                )
             )
-        else:
-            self.log(f"iteration {iteration}: no improvement ({candidate.name})")
-        return self._next_or_finalize(iteration, "iteration limit reached")
+        return plans
+
+    def _validate_candidates(self, candidates: List[Candidate]) -> List[ValidationResult]:
+        if len(candidates) <= 1:
+            return [self.validator.validate(candidates[0].code, self.cases, self.parsed_cases)]
+        workers = self._strategy_worker_count(len(candidates))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            return list(
+                executor.map(
+                    lambda candidate: self.validator.validate(candidate.code, self.cases, self.parsed_cases),
+                    candidates,
+                )
+            )
+
+    def _score_candidate_batch(
+        self,
+        candidates: List[Candidate],
+        best: Optional[ScoreResult],
+    ) -> List[ScoreResult]:
+        if len(candidates) <= 1:
+            return [
+                self.scorer.score(
+                    candidate=candidates[0],
+                    cases=self.cases,
+                    parsed_cases=self.parsed_cases,
+                    best=best,
+                    timeout=self.search_per_case_timeout,
+                )
+            ]
+
+        workers = self._strategy_worker_count(len(candidates))
+
+        def score_one(candidate: Candidate) -> ScoreResult:
+            scorer = Scorer(per_case_timeout=self.search_per_case_timeout)
+            return scorer.score(
+                candidate=candidate,
+                cases=self.cases,
+                parsed_cases=self.parsed_cases,
+                best=best,
+                timeout=self.search_per_case_timeout,
+            )
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            return list(executor.map(score_one, candidates))
+
+    def _strategy_worker_count(self, candidate_count: int) -> int:
+        return max(1, min(self.strategy_workers, max(1, candidate_count)))
+
+    def _normalize_candidate_name(
+        self,
+        candidate: Candidate,
+        iteration: int,
+        index: int,
+        plan: SolverPlan,
+        used_names: set[str],
+    ) -> None:
+        primary = plan.strategy_combination[0] if plan.strategy_combination else f"strategy_{index}"
+        default_name = f"llm_iter_{iteration:03d}_{index:02d}"
+        base = sanitize_name(candidate.name, default_name)
+        name = base
+        if name in used_names:
+            name = sanitize_name(f"{base}_{primary}", default_name)
+        counter = 2
+        while name in used_names:
+            name = sanitize_name(f"{base}_{primary}_{counter}", default_name)
+            counter += 1
+        candidate.name = name
+        candidate.rationale["name"] = name
+        candidate.rationale["parallel_strategy_plan"] = plan.name
+        candidate.rationale["primary_strategy"] = primary
+        used_names.add(name)
 
     def _finalize_run(self, state: WorkflowState) -> WorkflowState:
         if not self.candidates:
@@ -382,8 +599,8 @@ class AutoSolverWorkflow:
         return {"phase": "done", "iteration": int(state.get("iteration", self.iterations))}
 
     def _next_or_finalize(self, iteration: int, reason: str) -> WorkflowState:
-        next_iteration = iteration + 1
-        if next_iteration > self.iterations:
+        next_iteration = iteration + max(1, self.iteration_stride)
+        if iteration >= self.iterations or next_iteration > self.iterations:
             return {"phase": "finalize", "iteration": iteration, "stop_reason": reason}
         if self._time_exhausted():
             return {"phase": "finalize", "iteration": iteration, "stop_reason": "budget exhausted"}
@@ -452,12 +669,12 @@ class AutoSolverWorkflow:
             "run_id": self.run_state.run_id,
             "output_path": self.final_solver_path or os.path.abspath(self.output_path),
             "event_log_path": self.run_state.event_log_path,
-            "case_diagnostics": self.run_state.case_diagnostics,
             "timings": self.run_state.timings.timings,
             "candidate_hashes": self.run_state.candidate_hashes,
             "cases": [case.name for case in self.cases],
             "iterations_requested": self.iterations,
             "iterations_completed": len({candidate.iteration for candidate in self.candidates}),
+            "strategy_workers": self.strategy_workers,
             "best": serialize(self.best_score) if self.best_score else None,
             "instance_features": self.instance_features,
             "short_term_memory": self.memory.short_term,
@@ -531,6 +748,9 @@ class AutoSolverWorkflow:
         self.run_state.candidate_hashes[candidate.name] = value
         return value
 
+    def _remember_candidate_artifact(self, candidate: Candidate, artifact: IterationArtifact) -> None:
+        self.candidate_artifacts[candidate.name] = artifact
+
     def _repair_schema_failure(
         self,
         iteration: int,
@@ -580,9 +800,17 @@ class AutoSolverWorkflow:
         candidate: Candidate,
         validation: ValidationResult,
     ) -> Candidate:
-        plan = state.get("plan")
+        plan = None
+        plan_payload = (candidate.rationale or {}).get("plan")
+        if isinstance(plan_payload, dict):
+            try:
+                plan = SolverPlan.model_validate(plan_payload)
+            except Exception:
+                plan = None
         if plan is None:
-            plan = self.llm._fallback_plan(iteration, self.instance_features, self.memory.digest())
+            plan = state.get("plan")
+        if plan is None:
+            raise RuntimeError("validation repair requires the original SolverPlan; no generated plan is available")
         aggregate_features = self.instance_features.get("aggregate", {})
         memory_digest = self.memory.digest(
             features=aggregate_features,
@@ -628,9 +856,17 @@ class AutoSolverWorkflow:
                     context={"attempt": attempt, "reason": "validation_error", "error": str(exc)},
                 )
                 continue
+            self._normalize_candidate_name(
+                repaired,
+                iteration,
+                attempt,
+                plan,
+                set(self.run_state.candidate_hashes),
+            )
             self.candidates.append(repaired)
             repaired_hash = self._remember_candidate_hash(repaired)
             artifact = self.artifacts.save_candidate(repaired)
+            self._remember_candidate_artifact(repaired, artifact)
             repaired.rationale["_artifact_validation_path"] = artifact.validation_path
             self.memory.record_candidate(iteration, repaired.name, repaired.rationale, aggregate_features)
             self.repair_history.append(
@@ -735,3 +971,32 @@ class AutoSolverWorkflow:
 
 def _final_rank(score: ScoreResult) -> tuple:
     return (score.failures, -score.total_covered, score.total_penalty)
+
+
+def _unique_strings(values: List[Any]) -> List[str]:
+    seen = set()
+    result = []
+    for value in values:
+        item = str(value or "").strip()
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        result.append(item)
+    return result
+
+
+def _claim_worker_iteration(
+    iteration_counter: Any,
+    iteration_lock: Any,
+    max_iterations: Optional[int],
+    deadline: float,
+) -> Optional[int]:
+    if iteration_counter is None or iteration_lock is None or max_iterations is None:
+        return None
+    if time.time() >= deadline:
+        return None
+    with iteration_lock:
+        if iteration_counter.value >= max_iterations:
+            return None
+        iteration_counter.value += 1
+        return int(iteration_counter.value)

@@ -57,20 +57,17 @@ class ArtifactStore:
 
     def disk_results(self, limit: int = 20) -> List[Dict[str, Any]]:
         results: List[Dict[str, Any]] = []
-        if not os.path.isdir(self.artifact_dir):
-            return results
         for root, _, files in os.walk(self.artifact_dir):
             for name in files:
                 if not name.endswith(".score.json"):
                     continue
                 path = os.path.join(root, name)
-                try:
-                    with open(path, "r", encoding="utf-8") as handle:
-                        value = json.load(handle)
-                    value["_path"] = path
-                    results.append(value)
-                except Exception:
-                    continue
+                with open(path, "r", encoding="utf-8") as handle:
+                    value = json.load(handle)
+                if not isinstance(value, dict):
+                    raise RuntimeError(f"score artifact must contain a JSON object: {path}")
+                value["_path"] = path
+                results.append(value)
         results.sort(key=lambda item: item.get("rank", [999, 0, 1e18, 1e18]))
         return results[:limit]
 
