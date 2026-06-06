@@ -1,5 +1,7 @@
-"""Strategy and solver skill libraries."""
+"""No built-in strategy or solver skill catalog.
 
-from autosolver_agent.skills.library import SolverSkillLibrary, StrategyLibrary
+Feature, strategy, and skill knowledge is owned by the LLM-maintained
+framework in autosolver_agent.framework.
+"""
 
-__all__ = ["StrategyLibrary", "SolverSkillLibrary"]
+__all__: list[str] = []

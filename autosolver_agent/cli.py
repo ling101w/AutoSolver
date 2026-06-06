@@ -35,7 +35,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--strategy-workers",
         type=int,
         default=5,
-        help="Parallel independent worker processes. Each worker runs its own plan/evaluate loop and syncs shared memory.",
+        help="Worker count. Use 1 for a single workflow; use 2+ for parallel independent worker processes.",
     )
     parser.add_argument("--summary-out", default=None, help="Optional JSON summary output path.")
     parser.add_argument("--event-log", default=None, help="Optional JSONL event log path; defaults to artifact-dir/events.jsonl.")

@@ -7,7 +7,7 @@ import os
 import time
 from typing import Any, Dict, List, Optional
 
-from autosolver_agent.artifacts import write_json
+from autosolver_agent.artifacts import ArtifactStore, write_json
 from autosolver_agent.caseio import discover_case_paths, load_cases, parse_case
 from autosolver_agent.llm import LLMCodeGenerator
 from autosolver_agent.memory import MemoryStore
@@ -61,8 +61,8 @@ class AutoSolverLangChainAgent:
         self.event_log_path = event_log_path
 
     def run(self) -> Dict[str, Any]:
-        if self.strategy_workers < 2:
-            raise RuntimeError("AutoSolver Agent requires strategy_workers >= 2; single-worker mode is not supported.")
+        if self.strategy_workers < 1:
+            raise RuntimeError("AutoSolver Agent requires strategy_workers >= 1.")
         paths = self.case_paths or discover_case_paths(os.getcwd())
         cases = load_cases(paths, self.max_cases)
         if not cases:
@@ -70,7 +70,7 @@ class AutoSolverLangChainAgent:
         parsed_cases = [parse_case(case.text, case_name=case.name, path=case.path) for case in cases]
 
         deadline = time.time() + self.budget_seconds
-        if self.llm is None:
+        if self.llm is None and self.strategy_workers >= 2:
             LLMCodeGenerator.validate_environment()
             runner = ParallelAutoSolverRunner(
                 cases=cases,
@@ -100,9 +100,17 @@ class AutoSolverLangChainAgent:
             write_json(report_path, report)
             return report
 
-        memory = MemoryStore(self.memory_dir)
-        from autosolver_agent.artifacts import ArtifactStore
+        if self.llm is None:
+            LLMCodeGenerator.validate_environment()
+        return self._run_single_workflow(cases, parsed_cases, deadline)
 
+    def _run_single_workflow(
+        self,
+        cases: List[Any],
+        parsed_cases: List[Any],
+        deadline: float,
+    ) -> Dict[str, Any]:
+        memory = MemoryStore(self.memory_dir)
         artifacts = ArtifactStore(self.artifact_dir)
         llm = LLMCodeGenerator(model=self.llm_model, base_url=self.llm_base_url, llm=self.llm)
         workflow = AutoSolverWorkflow(

@@ -9,15 +9,15 @@ import unittest
 from unittest.mock import patch
 
 from autosolver_agent import AutoSolverLangChainAgent
-from autosolver_agent.caseio import CaseParseError, load_cases, parse_case, score_answer
+from autosolver_agent.caseio import CaseParseError, aggregate_features, dataset_features, load_cases, parse_case, score_answer
 from autosolver_agent.cli import build_parser
+from autosolver_agent.framework import FrameworkStore, FrameworkUpdate, FrameworkValidationError, SolverFramework
 from autosolver_agent.llm.schema import parse_candidate_envelope
 from autosolver_agent.memory import MemoryStore
 from autosolver_agent.memory.store import MEMORY_SCHEMA_VERSION
 from autosolver_agent.models import Case, ScoreResult
 from autosolver_agent.runtime import run_candidate
-from autosolver_agent.skills import SolverSkillLibrary, StrategyLibrary
-from autosolver_agent.tools import InstanceClassifier, Validator
+from autosolver_agent.tools import Validator
 from autosolver_agent.workflow.parallel import ParallelAutoSolverRunner, ParallelRunConfig
 from solvers import seed_solvers
 
@@ -50,11 +50,24 @@ class FakeResponse:
 
 
 class FakeLLM:
-    def __init__(self, outputs=None, *, plan_outputs=None, candidate_outputs=None, repair_outputs=None):
+    def __init__(
+        self,
+        outputs=None,
+        *,
+        plan_outputs=None,
+        candidate_outputs=None,
+        repair_outputs=None,
+        framework_outputs=None,
+        interpretation_outputs=None,
+        framework_update_outputs=None,
+    ):
         self.outputs = list(outputs or [])
         self.plan_outputs = list(plan_outputs or [])
         self.candidate_outputs = list(candidate_outputs or [])
         self.repair_outputs = list(repair_outputs or [])
+        self.framework_outputs = list(framework_outputs or [])
+        self.interpretation_outputs = list(interpretation_outputs or [])
+        self.framework_update_outputs = list(framework_update_outputs or [])
         self.lock = threading.Lock()
 
     def bind_tools(self, tools):
@@ -63,6 +76,12 @@ class FakeLLM:
     def invoke(self, messages):
         with self.lock:
             prompt = "\n".join(str(message) for message in messages)
+            if "SolverFramework schema" in prompt:
+                return FakeResponse(_pop_or_default(self.framework_outputs, structured_framework()))
+            if "InstanceInterpretation schema" in prompt:
+                return FakeResponse(_pop_or_default(self.interpretation_outputs, structured_interpretation()))
+            if "FrameworkUpdate schema" in prompt:
+                return FakeResponse(_pop_or_default(self.framework_update_outputs, structured_framework_update()))
             if "planning controller" in prompt or "SolverPlan schema" in prompt:
                 queue = self.plan_outputs or self.outputs
             elif "Repair attempt" in prompt:
@@ -74,6 +93,12 @@ class FakeLLM:
             return FakeResponse(queue.pop(0))
 
 
+def _pop_or_default(queue, default):
+    if queue:
+        return queue.pop(0)
+    return default
+
+
 def fake_candidate(name: str = "fake_solver") -> str:
     return structured_candidate(name)
 
@@ -82,7 +107,7 @@ def structured_plan(name: str = "structured_plan", strategies=None) -> str:
     return json.dumps(
         {
             "name": name,
-            "strategy_combination": list(strategies or ["bundle_first", "pair_replacement_polish"]),
+            "strategy_combination": list(strategies or ["risk_balanced_cover", "adaptive_pair_merge"]),
             "parameter_changes": {"beam_width": 8},
             "exploration_mode": "parallel_strategy",
             "reasoning": "use tool-provided features and memory to generate independent candidates",
@@ -102,12 +127,100 @@ def structured_candidate(name: str = "structured_solver", code: str = VALID_SOLV
             "rationale": {
                 "name": name,
                 "idea": "structured bundle smoke",
-                "strategy_combination": ["bundle_first"],
+                "strategy_combination": ["risk_balanced_cover"],
                 "parameter_changes": {"pair_weight": 10},
                 "expected_effect": "cover both tasks",
                 "risk_control": "validator repair",
             },
             "code": code,
+        },
+        ensure_ascii=False,
+    )
+
+
+def structured_framework() -> str:
+    return json.dumps(
+        {
+            "feature_dimensions": [
+                {
+                    "name": "bundle_opportunity",
+                    "description": "Detect whether multi-task groups can cover tasks efficiently.",
+                    "signals": ["pair_ratio", "bundle_ratio", "bundle_task_coverage"],
+                    "interpretation_notes": ["Compare bundle coverage with singleton availability."],
+                    "confidence": 0.7,
+                }
+            ],
+            "strategies": [
+                {
+                    "name": "risk_balanced_cover",
+                    "description": "Construct disjoint task coverage while balancing willingness and score.",
+                    "applicable_tags": ["bundle_opportunity"],
+                    "feature_signals": ["avg_willingness", "total_score", "bundle_ratio"],
+                    "implementation_notes": "Parse TSV rows, choose valid groups, then add couriers only when penalty improves.",
+                    "recommended_parameters": {"candidate_limit": 32},
+                    "risks": ["Must preserve global courier uniqueness."],
+                    "confidence": 0.7,
+                },
+                {
+                    "name": "adaptive_pair_merge",
+                    "description": "Try pair groups when they reduce expected penalty and preserve coverage.",
+                    "applicable_tags": ["bundle_opportunity"],
+                    "feature_signals": ["pair_ratio"],
+                    "implementation_notes": "Compare singleton cover with candidate pair groups under the same penalty model.",
+                    "recommended_parameters": {"pair_limit": 16},
+                    "risks": ["Pair groups may block better single assignments."],
+                    "confidence": 0.6,
+                },
+            ],
+            "skills": [
+                {
+                    "name": "safe_standard_solver",
+                    "strategy_names": ["risk_balanced_cover", "adaptive_pair_merge"],
+                    "construction_notes": "Generate one self-contained standard-library solve(input_text: str) implementation.",
+                    "code_contract": "Return a Python list and keep validation, scoring, runtime, and parser contracts unchanged.",
+                    "constraints": ["No duplicate tasks.", "No duplicate couriers."],
+                    "examples": ["Use deterministic tie-breakers for reproducible artifacts."],
+                    "confidence": 0.8,
+                }
+            ],
+        },
+        ensure_ascii=False,
+    )
+
+
+def structured_interpretation() -> str:
+    return json.dumps(
+        {
+            "tags": ["bundle_opportunity", "compact_case"],
+            "opportunities": ["The pair row can cover both tasks with one courier."],
+            "risks": ["A duplicate task assignment is invalid."],
+            "recommended_focus": ["risk_balanced_cover", "adaptive_pair_merge"],
+            "feature_notes": {"pair_ratio": "pair rows are available"},
+            "reasoning": "Use the maintained framework to prefer valid compact coverage.",
+            "confidence": 0.75,
+        },
+        ensure_ascii=False,
+    )
+
+
+def structured_framework_update(strategy_name: str = "risk_balanced_cover") -> str:
+    return json.dumps(
+        {
+            "update_reason": "Record evidence from the latest candidate evaluation.",
+            "source_experiments": ["fake_solver"],
+            "confidence": 0.65,
+            "strategies": [
+                {
+                    "name": strategy_name,
+                    "description": "Updated from validation and scoring evidence.",
+                    "applicable_tags": ["bundle_opportunity"],
+                    "feature_signals": ["pair_ratio"],
+                    "implementation_notes": "Keep full coverage first, then reduce penalty.",
+                    "recommended_parameters": {"candidate_limit": 24},
+                    "risks": ["Reject invalid duplicate assignments."],
+                    "confidence": 0.65,
+                }
+            ],
         },
         ensure_ascii=False,
     )
@@ -120,54 +233,46 @@ def solve(input_text: str) -> list:
 
 
 class ModularAgentTests(unittest.TestCase):
-    def test_parse_classify_and_score(self):
+    def test_parse_objective_features_and_score(self):
         parsed = parse_case(CASE_TEXT)
         self.assertEqual(parsed.all_tasks, ["t0", "t1"])
-        features = InstanceClassifier().classify([Case("case.txt", CASE_TEXT)], [parsed])
-        self.assertIn("recommended_focus", features["aggregate"])
-        self.assertIn("feature_library", features)
-        self.assertIn("bundle_ratio", features["aggregate"])
-        self.assertIn("single_cover_available", features["aggregate"]["tags"])
-        self.assertIn("pair_replacement_polish", features["aggregate"]["recommended_focus"])
+        features = dataset_features(parsed)
+        aggregate = aggregate_features([features])
+        self.assertNotIn("recommended_focus", aggregate)
+        self.assertNotIn("tags", aggregate)
+        self.assertIn("bundle_ratio", aggregate)
         scored = score_answer(parsed, [("t0,t1", ["c2"])])
         self.assertTrue(scored["valid"])
         self.assertEqual(scored["covered"], 2)
 
-    def test_strategy_and_solver_context_include_reference_examples(self):
-        strategy_payload = json.loads(
-            StrategyLibrary().as_prompt_context(
-                {
-                    "task_count": 2,
-                    "courier_count": 3,
-                    "pair_ratio": 0.25,
-                    "avg_willingness": 0.6,
-                    "capacity_ratio": 1.5,
-                }
-            )
-        )
-        strategy_by_name = {item["name"]: item for item in strategy_payload["strategies"]}
-        self.assertIn("basic_seed_solver_pack", strategy_by_name["bundle_first"]["reference_examples"])
-        self.assertIn("task_first_greedy_repair_reference", strategy_by_name["bundle_first"]["reference_examples"])
-        self.assertIn("pair_replacement_polish", strategy_by_name)
-        self.assertIn("tabu_confchange", strategy_by_name)
-        self.assertIn("template_task_first_reference", strategy_by_name["pair_replacement_polish"]["reference_examples"])
+    def test_framework_store_bootstraps_updates_and_rejects_unsafe_payload(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = FrameworkStore(tmp)
+            self.assertTrue(store.is_empty())
+            framework = SolverFramework.model_validate(json.loads(structured_framework()))
+            applied = store.bootstrap(framework, source="test_bootstrap")
+            self.assertEqual(applied["action"], "bootstrap_applied")
+            self.assertFalse(store.is_empty())
+            self.assertIn("risk_balanced_cover", store.candidate_strategy_names())
 
-        solver_payload = json.loads(SolverSkillLibrary().as_prompt_context())
-        skill_by_name = {item["name"]: item for item in solver_payload["solver_skills"]}
-        self.assertIn("incremental_bitmask_state", skill_by_name)
-        self.assertIn("metaheuristic_loop_control", skill_by_name)
-        self.assertIn("coverage_repair_guardrails", skill_by_name)
-        example_by_name = {item["name"]: item for item in solver_payload["solver_examples"]}
-        self.assertEqual(example_by_name["basic_seed_solver_pack"]["source_file"], "solvers/seed_solvers.py")
-        self.assertEqual(example_by_name["task_first_greedy_repair_reference"]["source_file"], "solvers/solver.py")
-        self.assertEqual(example_by_name["multi_start_hybrid_reference"]["source_file"], "solvers/solver_70433_best_E1.py")
-        self.assertEqual(example_by_name["template_task_first_reference"]["source_file"], "examples/solver_template_2.py")
-        self.assertEqual(
-            example_by_name["template_hybrid_metaheuristic_reference"]["source_file"],
-            "examples/solver_template_1.py",
-        )
-        self.assertIn("init_min_cost_flow_single", example_by_name["multi_start_hybrid_reference"]["prompt_excerpt"])
-        self.assertIn("tabu_confchange", example_by_name["template_hybrid_metaheuristic_reference"]["prompt_excerpt"])
+            update = json.loads(structured_framework_update("latency_aware_repair"))
+            update["strategies"][0]["applicable_tags"] = ["compact_case"]
+            applied = store.apply_update(
+                FrameworkUpdate.model_validate(update),
+                source="test_update",
+                iteration=1,
+            )
+            self.assertEqual(applied["action"], "update_applied")
+            self.assertIn("latency_aware_repair", store.candidate_strategy_names())
+
+            bad_payload = json.loads(structured_framework_update("unsafe_strategy"))
+            bad_payload["strategies"][0]["implementation_notes"] = "call open('x')"
+            with self.assertRaises(FrameworkValidationError):
+                store.apply_update(
+                    FrameworkUpdate.model_validate(bad_payload),
+                    source="test_update",
+                    iteration=2,
+                )
 
     def test_seed_solvers_are_directly_callable_and_valid(self):
         parsed = parse_case(CASE_TEXT)
@@ -214,6 +319,8 @@ def solve(input_text: str) -> list:
             "def solve(input_text: str):\n    __import__('os')\n    return []\n",
             "def solve(input_text: str):\n    globals()\n    return []\n",
             "def solve(input_text: str):\n    return [(().__class__.__name__, [])]\n",
+            "import time\n\ndef solve(input_text: str):\n    deadline = time.time() + 1\n    return []\n",
+            "from time import time\n\ndef solve(input_text: str):\n    deadline = time() + 1\n    return []\n",
         ]
         for code in forbidden_snippets:
             with self.subTest(code=code):
@@ -294,7 +401,7 @@ def solve(input_text: str) -> list:
                 iteration=1,
                 candidate_name="first",
                 features={},
-                strategy=["expected_greedy"],
+                strategy=["simple_cover_seed"],
                 params={},
             )
             first.save()
@@ -303,7 +410,7 @@ def solve(input_text: str) -> list:
                 iteration=2,
                 candidate_name="second",
                 features={},
-                strategy=["bundle_first"],
+                strategy=["risk_balanced_cover"],
                 params={},
             )
             second.save()
@@ -311,8 +418,8 @@ def solve(input_text: str) -> list:
             loaded = MemoryStore(tmp, max_long_term_items=10)
             candidates = {record["candidate"] for record in loaded.long_term["experiments"]}
             self.assertTrue({"first", "second"}.issubset(candidates))
-            self.assertEqual(loaded.long_term["bandit_arms"]["expected_greedy"]["count"], 1)
-            self.assertEqual(loaded.long_term["bandit_arms"]["bundle_first"]["count"], 1)
+            self.assertEqual(loaded.long_term["bandit_arms"]["simple_cover_seed"]["count"], 1)
+            self.assertEqual(loaded.long_term["bandit_arms"]["risk_balanced_cover"]["count"], 1)
             self.assertTrue(os.path.exists(os.path.join(tmp, "long_term_memory.json.lock")))
 
     def test_structured_candidate_schema(self):
@@ -345,7 +452,7 @@ def solve(input_text: str) -> list:
                 iteration=1,
                 candidate_name="good",
                 features=features,
-                strategy=["bundle_first"],
+                strategy=["risk_balanced_cover"],
                 params={"pair_weight": 10},
                 score=score,
             )
@@ -445,7 +552,7 @@ def solve(input_text: str) -> list:
                                 {
                                     "iteration": claimed[0] if claimed else worker_id + 1,
                                     "candidate": f"worker_{worker_id}_solver",
-                                    "strategy": ["bundle_first"],
+                                    "strategy": ["risk_balanced_cover"],
                                     "params": {},
                                     "score": {
                                         "rank": [0, -2, 30.0 + worker_id, 0.01],
@@ -546,6 +653,35 @@ def solve(input_text: str) -> list:
                 events = [json.loads(line) for line in handle if line.strip()]
             self.assertTrue(events)
             self.assertTrue(all("run_id" in item and "phase" in item and "event" in item for item in events))
+
+    def test_agent_strategy_workers_one_runs_single_workflow(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            case_path = os.path.join(tmp, "case.txt")
+            out_path = os.path.join(tmp, "generated_submit_solution.py")
+            with open(case_path, "w", encoding="utf-8") as handle:
+                handle.write(CASE_TEXT)
+            agent = AutoSolverLangChainAgent(
+                case_paths=[case_path],
+                output_path=out_path,
+                budget_seconds=10,
+                per_case_timeout=2,
+                search_per_case_timeout=1,
+                iterations=1,
+                memory_dir=os.path.join(tmp, "memory"),
+                artifact_dir=os.path.join(tmp, "artifacts"),
+                llm=FakeLLM(
+                    plan_outputs=[structured_plan("single_worker_plan")],
+                    candidate_outputs=[fake_candidate("single_worker_solver")],
+                ),
+                max_cases=1,
+                verbose=False,
+                strategy_workers=1,
+            )
+            report = agent.run()
+            self.assertTrue(os.path.exists(out_path))
+            self.assertEqual(report["strategy_workers"], 1)
+            self.assertEqual(report["iterations_completed"], 1)
+            self.assertIsNotNone(report["best"])
 
     def test_agent_rejects_malformed_cases(self):
         with tempfile.TemporaryDirectory() as tmp:

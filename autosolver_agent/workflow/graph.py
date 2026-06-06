@@ -12,14 +12,15 @@ from langgraph.graph import END as LANGGRAPH_END
 from langgraph.graph import StateGraph as LangGraphStateGraph
 
 from autosolver_agent.artifacts import ArtifactStore, serialize
+from autosolver_agent.caseio import aggregate_features, dataset_features
 from autosolver_agent.events import code_hash, now_monotonic
+from autosolver_agent.framework import FrameworkStore
 from autosolver_agent.llm import LLMCodeGenerator
 from autosolver_agent.llm.generator import sanitize_name
-from autosolver_agent.llm.schema import SolverPlan
+from autosolver_agent.llm.schema import SolverPlan, model_dump
 from autosolver_agent.memory import MemoryStore
 from autosolver_agent.models import Candidate, Case, IterationArtifact, ParsedCase, ScoreResult, ValidationResult
-from autosolver_agent.skills import SolverSkillLibrary, StrategyLibrary
-from autosolver_agent.tools import InstanceClassifier, PlannerToolbox, Scorer, Validator
+from autosolver_agent.tools import PlannerToolbox, Scorer, Validator
 from autosolver_agent.workflow.services import (
     EvaluationService,
     FinalizationService,
@@ -109,12 +110,11 @@ class AutoSolverWorkflow:
             event_log_path=os.path.abspath(resolved_event_log),
         )
         self.events = build_event_recorder(self.run_state.event_log_path, run_id)
-        self.classifier = InstanceClassifier()
+        self.framework_store = FrameworkStore(self.memory.memory_dir)
         self.validator = Validator(smoke_timeout=min(2.0, search_per_case_timeout))
         self.scorer = Scorer(per_case_timeout=search_per_case_timeout)
-        self.strategy_library = StrategyLibrary()
-        self.solver_library = SolverSkillLibrary()
         self.instance_features: Dict[str, Any] = {}
+        self.objective_features: Dict[str, Any] = {}
         self.best_candidate: Optional[Candidate] = None
         self.best_score: Optional[ScoreResult] = None
         self.candidates: List[Candidate] = []
@@ -128,6 +128,7 @@ class AutoSolverWorkflow:
         self.memory_retrieval: List[Dict[str, Any]] = []
         self.bandit_trace: List[Dict[str, Any]] = []
         self.experiment_records: List[Dict[str, Any]] = []
+        self.framework_updates: List[Dict[str, Any]] = []
         self.notes: List[str] = []
         self.final_solver_path: Optional[str] = None
         self.generation_service = GenerationService(self)
@@ -211,16 +212,51 @@ class AutoSolverWorkflow:
         )
 
     def _classify_instances(self, state: WorkflowState) -> WorkflowState:
-        self.instance_features = self.classifier.classify(self.cases, self.parsed_cases)
-        self.log(
-            "classified instances: focus="
-            + ",".join(self.instance_features.get("aggregate", {}).get("recommended_focus", []))
+        iteration = int(state.get("iteration", 0))
+        self.objective_features = self._objective_feature_payload()
+        objective_aggregate = self.objective_features.get("aggregate", {})
+        memory_digest = self.memory.digest(
+            features=objective_aggregate,
+            top_k=self.memory_top_k,
+            exploration=self.bandit_exploration,
         )
+        memory_digest["solver_framework"] = self.framework_store.digest()
+        if self.framework_store.is_empty():
+            framework = self.llm.bootstrap_framework(
+                objective_features=self.objective_features,
+                memory_digest=memory_digest,
+                case_samples=self._case_samples(),
+            )
+            applied = self.framework_store.bootstrap(framework, source="llm_bootstrap")
+            self.framework_updates.append({"iteration": iteration, **applied})
+            self._record_event("framework_bootstrapped", phase="classify", iteration=iteration, context=applied)
+
+        self.framework_store.reload()
+        framework_context = self.framework_store.prompt_context()
+        interpretation = self.llm.interpret_instances(
+            iteration=iteration,
+            objective_features=self.objective_features,
+            solver_framework_context=framework_context,
+            memory_digest=memory_digest,
+            case_samples=self._case_samples(),
+        )
+        aggregate = dict(objective_aggregate)
+        aggregate["tags"] = list(interpretation.tags)
+        aggregate["recommended_focus"] = list(interpretation.recommended_focus)
+        aggregate["framework_confidence"] = interpretation.confidence
+        self.instance_features = {
+            "aggregate": aggregate,
+            "cases": self.objective_features.get("cases", []),
+            "objective_features": self.objective_features,
+            "interpretation": interpretation.model_dump(mode="json"),
+            "solver_framework": self.framework_store.snapshot(),
+        }
+        self.log("interpreted instances: focus=" + ",".join(aggregate.get("recommended_focus", [])))
         self._record_event(
-            "instances_classified",
+            "instances_interpreted",
             phase="classify",
-            iteration=int(state.get("iteration", 0)),
-            context={"case_count": len(self.cases)},
+            iteration=iteration,
+            context={"case_count": len(self.cases), "tags": aggregate.get("tags", []), "recommended_focus": aggregate.get("recommended_focus", [])},
         )
         return {"phase": "generate", "iteration": 1}
 
@@ -229,29 +265,37 @@ class AutoSolverWorkflow:
         if self._time_exhausted():
             return {"phase": "finalize", "iteration": iteration, "stop_reason": "budget exhausted before generation"}
 
+        self.framework_store.reload()
         aggregate_features = self.instance_features.get("aggregate", {})
-        strategy_context = self.strategy_library.as_prompt_context(aggregate_features)
-        solver_context = self.solver_library.as_prompt_context()
+        framework_context = self.framework_store.prompt_context()
+        solver_context = framework_context
         memory_digest = self.memory.digest(
             features=aggregate_features,
             top_k=self.memory_top_k,
             exploration=self.bandit_exploration,
         )
+        memory_digest["solver_framework"] = self.framework_store.digest()
         best_summary = self._best_code_summary()
+        candidate_arms = _unique_strings(
+            list(aggregate_features.get("recommended_focus", []))
+            + list(aggregate_features.get("tags", []))
+            + self.framework_store.candidate_strategy_names()
+        )
         toolbox = PlannerToolbox(
             instance_features=self.instance_features,
-            strategy_context=strategy_context,
+            solver_framework=self.framework_store.snapshot(),
             memory=self.memory,
             artifacts=self.artifacts,
             feature_query=aggregate_features,
             memory_top_k=self.memory_top_k,
             bandit_exploration=self.bandit_exploration,
             best_summary=best_summary,
+            candidate_arms=candidate_arms,
         )
         plan = self.llm.plan(
             iteration=iteration,
             instance_features=self.instance_features,
-            strategy_context=strategy_context,
+            solver_framework_context=framework_context,
             memory_digest=memory_digest,
             previous_impact=self.impact_analysis,
             toolbox=toolbox,
@@ -450,6 +494,7 @@ class AutoSolverWorkflow:
             else:
                 self.log(f"iteration {iteration}: no improvement ({candidate.name})")
 
+        self._reflect_framework(iteration, state, final_items)
         reason = "iteration limit reached" if valid_count else "validation failed"
         return self._next_or_finalize(iteration, reason)
 
@@ -463,14 +508,16 @@ class AutoSolverWorkflow:
         if self.strategy_workers <= 1:
             return [base_plan]
 
-        selected = [item.name for item in self.strategy_library.select_for_features(aggregate_features)]
         bandit = [
             str(item.get("arm"))
             for item in list(memory_digest.get("bandit_recommendations", []))
             + list(tool_context.get("bandit_recommendations", []))
             if item.get("arm")
         ]
-        primary_names = _unique_strings(list(base_plan.strategy_combination) + bandit + selected)
+        selected = list(tool_context.get("solver_framework", {}).get("framework", {}).get("strategies", []))
+        selected_names = [str(item.get("name")) for item in selected if isinstance(item, dict) and item.get("name")]
+        interpreted_focus = list(aggregate_features.get("recommended_focus", []))
+        primary_names = _unique_strings(list(base_plan.strategy_combination) + bandit + interpreted_focus + selected_names)
         if not primary_names:
             return [base_plan]
 
@@ -677,6 +724,8 @@ class AutoSolverWorkflow:
             "strategy_workers": self.strategy_workers,
             "best": serialize(self.best_score) if self.best_score else None,
             "instance_features": self.instance_features,
+            "solver_framework": self.framework_store.snapshot(),
+            "framework_updates": self.framework_updates,
             "short_term_memory": self.memory.short_term,
             "long_term_memory_digest": self.memory.digest(),
             "planner_trace": self.planner_trace,
@@ -768,7 +817,7 @@ class AutoSolverWorkflow:
                     plan=plan,
                     errors=[{"type": "schema_error", "message": last_error}],
                     instance_features=self.instance_features,
-                    solver_context=self.solver_library.as_prompt_context(),
+                    solver_context=self.framework_store.prompt_context(),
                     memory_digest=memory_digest,
                     case_samples=self._case_samples(),
                     per_case_timeout=self.per_case_timeout,
@@ -817,6 +866,7 @@ class AutoSolverWorkflow:
             top_k=self.memory_top_k,
             exploration=self.bandit_exploration,
         )
+        memory_digest["solver_framework"] = self.framework_store.digest()
         best_summary = self._best_code_summary()
         current = candidate
         current_validation = validation
@@ -827,7 +877,7 @@ class AutoSolverWorkflow:
                     plan=plan,
                     errors=current_validation.errors,
                     instance_features=self.instance_features,
-                    solver_context=self.solver_library.as_prompt_context(),
+                    solver_context=self.framework_store.prompt_context(),
                     memory_digest=memory_digest,
                     case_samples=self._case_samples(),
                     per_case_timeout=self.per_case_timeout,
@@ -927,6 +977,57 @@ class AutoSolverWorkflow:
         )
         self.experiment_records.append(record)
 
+    def _reflect_framework(
+        self,
+        iteration: int,
+        state: WorkflowState,
+        final_items: List[CandidateEvaluationItem],
+    ) -> None:
+        try:
+            plans = [model_dump(plan) for plan in list(state.get("plans") or ([state["plan"]] if state.get("plan") is not None else []))]
+            evaluations = [self._evaluation_summary(item) for item in final_items]
+            update = self.llm.reflect_framework(
+                iteration=iteration,
+                solver_framework_context=self.framework_store.prompt_context(),
+                instance_features=self.instance_features,
+                plans=plans,
+                evaluations=evaluations,
+                experiments=self.experiment_records,
+                previous_impact=self.impact_analysis,
+            )
+            applied = self.framework_store.apply_update(update, source="llm_reflection", iteration=iteration)
+            self.framework_updates.append({"iteration": iteration, **applied})
+            self.instance_features["solver_framework"] = self.framework_store.snapshot()
+            self._record_event("framework_updated", phase="validate_and_score", iteration=iteration, context=applied)
+        except Exception as exc:
+            failure = {"iteration": iteration, "action": "framework_update_rejected", "error": str(exc)}
+            self.framework_updates.append(failure)
+            self._record_event("framework_update_rejected", phase="validate_and_score", iteration=iteration, context=failure)
+
+    def _evaluation_summary(self, item: CandidateEvaluationItem) -> Dict[str, Any]:
+        candidate = item["candidate"]
+        return {
+            "candidate": candidate.name,
+            "rationale": candidate.rationale,
+            "validation": serialize(item["validation"]),
+            "score": serialize(item["score"]) if item.get("score") is not None else None,
+            "impact": item.get("impact"),
+        }
+
+    def _objective_feature_payload(self) -> Dict[str, Any]:
+        per_case = []
+        features = []
+        for case, parsed in zip(self.cases, self.parsed_cases):
+            item = dataset_features(parsed)
+            item["name"] = case.name
+            features.append({key: value for key, value in item.items() if key != "name"})
+            per_case.append(item)
+        return {
+            "aggregate": aggregate_features(features),
+            "cases": per_case,
+            "interpretation_owner": "llm_framework",
+        }
+
     def _best_code_summary(self) -> Dict[str, Any]:
         summary = self.memory.best_experiment_summary()
         if self.best_candidate is not None:
@@ -966,6 +1067,7 @@ class AutoSolverWorkflow:
             "best_covered": self.best_score.total_covered if self.best_score else None,
             "best_tasks": self.best_score.total_tasks if self.best_score else None,
             "bandit_arms": self.memory.long_term.get("bandit_arms", {}),
+            "framework": self.framework_store.digest(),
         }
 
 

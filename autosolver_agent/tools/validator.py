@@ -23,6 +23,7 @@ FORBIDDEN_IMPORT_ROOTS = {
     "shutil",
     "glob",
     "importlib",
+    "time",
 }
 
 FORBIDDEN_CALLS = {

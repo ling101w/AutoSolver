@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from autosolver_agent.artifacts import ArtifactStore, write_json
+from autosolver_agent.framework import FrameworkStore
 from autosolver_agent.llm import LLMCodeGenerator
 from autosolver_agent.memory import MemoryStore
 from autosolver_agent.models import Candidate, Case, ParsedCase, ScoreResult
@@ -134,6 +135,7 @@ class ParallelAutoSolverRunner:
 
         memory = MemoryStore(self.config.memory_dir)
         memory.save(short_term_path=os.path.join(memory.memory_dir, "short_term_last_run.json"))
+        framework = FrameworkStore(self.config.memory_dir)
 
         report = {
             "run_mode": "parallel_workers",
@@ -147,6 +149,7 @@ class ParallelAutoSolverRunner:
             "worker_reports": worker_reports,
             "worker_errors": errors,
             "long_term_memory_digest": memory.digest(),
+            "solver_framework": framework.snapshot(),
             "summary": {
                 "best_candidate": best_pair[0].name,
                 "best_rank": list(best_pair[0].rank),

@@ -6,6 +6,17 @@ import json
 import os
 from typing import Any, Dict, List, Optional
 
+from autosolver_agent.framework import (
+    FrameworkUpdate,
+    InstanceInterpretation,
+    SolverFramework,
+    framework_update_schema_text,
+    instance_interpretation_schema_text,
+    parse_framework_update,
+    parse_instance_interpretation,
+    parse_solver_framework,
+    solver_framework_schema_text,
+)
 from autosolver_agent.llm.schema import (
     SolverPlan,
     candidate_schema_text,
@@ -68,7 +79,7 @@ class LLMCodeGenerator:
         self,
         iteration: int,
         instance_features: Dict[str, Any],
-        strategy_context: str,
+        solver_framework_context: str,
         memory_digest: Dict[str, Any],
         previous_impact: List[Dict[str, Any]],
         toolbox: Optional[PlannerToolbox] = None,
@@ -83,15 +94,19 @@ class LLMCodeGenerator:
             raise RuntimeError("Planning requires LangChain planner tools; build_langchain_tools returned no tools.")
 
         system = (
-            "You are the planning controller for AutoSolver Agent. Use tools to inspect instance features, "
-            "strategy guidance, memory, bandit recommendations, and the current best artifact. "
+            "You are the planning controller for AutoSolver Agent. Use tools to inspect objective instance features, "
+            "the LLM-maintained solver framework, memory, bandit recommendations, and the current best artifact. "
+            "You may create strategy names that are not yet in the framework if the instance evidence supports them. "
             "Return only JSON matching this SolverPlan schema:\n"
             + plan_schema_text()
         )
         user = (
             f"Plan solver generation for iteration {iteration}. "
-            "Prefer strategies that fit current features and historical results. "
-            "Use a balanced explore/exploit policy. Previous impact:\n"
+            "Prefer strategies that fit current interpreted features and historical results. "
+            "Use a balanced explore/exploit policy and preserve the solver safety contract. "
+            "Current solver framework context:\n"
+            + solver_framework_context
+            + "\n\nPrevious impact:\n"
             + _json(previous_impact[-5:])
         )
         messages: List[Any] = [("system", system), ("human", user)]
@@ -122,6 +137,101 @@ class LLMCodeGenerator:
         self.last_tool_calls = trace or toolbox.trace
         return plan
 
+    def bootstrap_framework(
+        self,
+        objective_features: Dict[str, Any],
+        memory_digest: Dict[str, Any],
+        case_samples: List[str],
+    ) -> SolverFramework:
+        system = (
+            "You maintain AutoSolver Agent's feature, strategy, and implementation-skill framework. "
+            "There is no hardcoded seed catalog. Create an initial solver framework from the objective case statistics, "
+            "historical memory, and the fixed solver safety contract. Do not propose time-based early-stop or deadline logic "
+            "inside generated solve() implementations. Return only JSON matching this SolverFramework schema:\n"
+            + solver_framework_schema_text()
+        )
+        user = (
+            "Objective case features:\n{features}\n\n"
+            "Memory digest:\n{memory}\n\n"
+            "Input case samples:\n{samples}\n\n"
+            "Create feature_dimensions, strategies, and skills that are useful for generating standard-library "
+            "solve(input_text: str) -> list candidates. Do not propose internal search-stage timeout checks, time imports, "
+            "or changes to validator, scorer, runtime, parser, or the output contract."
+        ).format(
+            features=_json(objective_features),
+            memory=_json(memory_digest),
+            samples="\n\n---\n\n".join(case_samples),
+        )
+        return parse_solver_framework(self._invoke(system, user))
+
+    def interpret_instances(
+        self,
+        iteration: int,
+        objective_features: Dict[str, Any],
+        solver_framework_context: str,
+        memory_digest: Dict[str, Any],
+        case_samples: List[str],
+    ) -> InstanceInterpretation:
+        system = (
+            "You interpret delivery-assignment instances using the LLM-maintained solver framework. "
+            "Do not rely on hardcoded thresholds; derive tags, opportunities, risks, and recommended strategy focus "
+            "from the supplied objective statistics and framework. Return only JSON matching this InstanceInterpretation schema:\n"
+            + instance_interpretation_schema_text()
+        )
+        user = (
+            "Iteration: {iteration}\n\n"
+            "Objective case features:\n{features}\n\n"
+            "Solver framework context:\n{framework}\n\n"
+            "Memory digest:\n{memory}\n\n"
+            "Input case samples:\n{samples}"
+        ).format(
+            iteration=iteration,
+            features=_json(objective_features),
+            framework=solver_framework_context,
+            memory=_json(memory_digest),
+            samples="\n\n---\n\n".join(case_samples),
+        )
+        return parse_instance_interpretation(self._invoke(system, user))
+
+    def reflect_framework(
+        self,
+        iteration: int,
+        solver_framework_context: str,
+        instance_features: Dict[str, Any],
+        plans: List[Dict[str, Any]],
+        evaluations: List[Dict[str, Any]],
+        experiments: List[Dict[str, Any]],
+        previous_impact: List[Dict[str, Any]],
+    ) -> FrameworkUpdate:
+        system = (
+            "You maintain AutoSolver Agent's persistent feature/strategy/skill framework after candidate evaluation. "
+            "Return a partial update: add or replace only useful framework entries, or retire entries that the evidence "
+            "shows are misleading. Do not add time-based early-stop or deadline logic as a framework skill. "
+            "The validator, scorer, runtime sandbox, parser, and solve() contract are immutable. "
+            "Return only JSON matching this FrameworkUpdate schema:\n"
+            + framework_update_schema_text()
+        )
+        user = (
+            "Iteration: {iteration}\n\n"
+            "Current solver framework context:\n{framework}\n\n"
+            "Interpreted instance features:\n{features}\n\n"
+            "Plans:\n{plans}\n\n"
+            "Candidate evaluations:\n{evaluations}\n\n"
+            "Recent experiments:\n{experiments}\n\n"
+            "Previous impact:\n{impact}\n\n"
+            "Use both successes and failures as evidence. Keep updates concise and safe. Avoid internal timeout logic; "
+            "runtime limits are handled outside candidate code."
+        ).format(
+            iteration=iteration,
+            framework=solver_framework_context,
+            features=_json(instance_features),
+            plans=_json(plans),
+            evaluations=_json(evaluations),
+            experiments=_json(experiments[-8:]),
+            impact=_json(previous_impact[-8:]),
+        )
+        return parse_framework_update(self._invoke(system, user))
+
     def generate_from_plan(
         self,
         iteration: int,
@@ -138,22 +248,25 @@ class LLMCodeGenerator:
         system = (
             "You are AutoSolver Agent's code generator. Generate one complete Python solver. "
             "The solver must use only Python standard library and define solve(input_text: str) -> list. "
-            "Do not use file IO, network IO, subprocess, eval, exec, compile, or dynamic imports. "
-            "When solver_examples are provided, use them as reference architectures and adapt their patterns "
-            "to the current SolverPlan instead of copying every routine. "
+            "Do not use file IO, network IO, subprocess, eval, exec, compile, dynamic imports, or the time module. "
+            "Do not implement search-stage timeout checks or deadline-based early exits inside solve(); external runtime "
+            "limits are handled by the agent. "
+            "Use the LLM-maintained solver framework as guidance, but feel free to create a new strategy variation "
+            "when the current SolverPlan calls for it. "
             "Return exactly one JSON object matching this CandidateEnvelope schema:\n"
             + candidate_schema_text()
         )
         user = (
             "SolverPlan:\n{plan}\n\n"
             "Instance features:\n{features}\n\n"
-            "Solver skill context:\n{solvers}\n\n"
+            "LLM-maintained solver framework:\n{solvers}\n\n"
             "Memory digest:\n{memory}\n\n"
             "Tool context:\n{tool_context}\n\n"
             "Disk historical results:\n{disk}\n\n"
             "Previous impact analysis:\n{impact}\n\n"
             "Input case samples:\n{samples}\n\n"
-            "Constraint: per-case judge timeout is {timeout:.2f}s; keep an internal safety margin in solve(). "
+            "Constraint: the external judge timeout is {timeout:.2f}s per case. Keep the algorithm bounded by input size "
+            "and fixed iteration limits, not by time checks. "
             "The JSON must include rationale fields name, idea, strategy_combination, parameter_changes, "
             "expected_effect, risk_control, and code containing the complete Python implementation."
         ).format(
@@ -197,8 +310,9 @@ class LLMCodeGenerator:
     ) -> Candidate:
         system = (
             "You repair AutoSolver candidate solvers. Return exactly one JSON object matching this "
-            "CandidateEnvelope schema. Use solver_examples as reference architectures when fixing construction, "
-            "coverage repair, or local-search issues, while keeping the solver self-contained:\n"
+            "CandidateEnvelope schema. Use the LLM-maintained solver framework when fixing construction, "
+            "coverage repair, or search issues, while keeping the solver self-contained. Do not add time imports, "
+            "deadline checks, or search-stage timeout interruption logic inside solve():\n"
             + candidate_schema_text()
         )
         user = (
@@ -212,9 +326,10 @@ class LLMCodeGenerator:
             "Memory digest:\n{memory}\n\n"
             "Best code summary:\n{best}\n\n"
             "Score delta/context:\n{score_delta}\n\n"
-            "Solver skill context:\n{solvers}\n\n"
+            "LLM-maintained solver framework:\n{solvers}\n\n"
             "Input case samples:\n{samples}\n\n"
-            "Keep solve() standard-library only and below {timeout:.2f}s per case."
+            "Keep solve() standard-library only and efficient for an external {timeout:.2f}s per-case judge. "
+            "Use deterministic input-size bounds instead of time-based cutoffs."
         ).format(
             attempt=attempt,
             iteration=iteration,
