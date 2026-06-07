@@ -1,6 +1,6 @@
 # AutoSolver Agent
 
-当前发布版本：`v1.5.0`
+当前发布版本：`v1.5.2`
 
 AutoSolver Agent 是一个面向配送分配问题的自动求解器生成系统。它基于 LangChain、LangGraph 和 OpenAI 兼容 LLM 接口，将实例分析、策略规划、候选代码生成、安全验证、评分、长期记忆和最终复核组织成一条可追踪的迭代工作流。
 
@@ -342,15 +342,15 @@ runs/autosolver_artifacts/worker_01/
 
 ```bash
 docker build \
-  --build-arg VERSION=1.5.0 \
+  --build-arg VERSION=1.5.2 \
   --build-arg VCS_REF="$(git rev-parse --short HEAD)" \
-  -t autosolver-agent:1.5.0 .
+  -t autosolver-agent:1.5.2 .
 ```
 
 查看版本：
 
 ```bash
-docker run --rm autosolver-agent:1.5.0 --version
+docker run --rm autosolver-agent:1.5.2 --version
 ```
 
 运行 case：
@@ -362,7 +362,7 @@ docker run --rm \
   -e AUTOSOLVER_LLM_MODEL="$AUTOSOLVER_LLM_MODEL" \
   -v "$PWD/examples:/app/examples:ro" \
   -v "$PWD/runs:/app/runs" \
-  autosolver-agent:1.5.0 \
+  autosolver-agent:1.5.2 \
   --cases examples/demo_case.txt \
   --out runs/docker/generated_submit_solution.py \
   --budget 90 \
@@ -405,7 +405,8 @@ CI 当前执行：
 | --- | --- |
 | `OPENAI_API_KEY` / `OPENAI_KEY` | LLM API key。 |
 | `OPENAI_BASE_URL` / `OPENAI_API_BASE` | OpenAI 兼容服务地址。 |
-| `AUTOSOLVER_LLM_MODEL` | 默认模型名。 |
+| `AUTOSOLVER_LLM_MODEL` / `OPENAI_MODEL` | 默认模型名，优先使用 `AUTOSOLVER_LLM_MODEL`。 |
+| `AUTOSOLVER_LLM_TIMEOUT` / `OPENAI_TIMEOUT` / `OPENAI_REQUEST_TIMEOUT` | 单次 LLM 请求超时秒数，默认 `300`。 |
 | `AUTOSOLVER_WIRE_API` / `OPENAI_WIRE_API` | 设为 `responses` 时启用 responses API。 |
 | `AUTOSOLVER_REASONING_EFFORT` / `OPENAI_REASONING_EFFORT` | 传递 reasoning effort。 |
 | `AUTOSOLVER_DISABLE_RESPONSE_STORAGE` / `OPENAI_DISABLE_RESPONSE_STORAGE` | 为真时向 ChatOpenAI 传入 `store=False`。 |
@@ -429,4 +430,4 @@ CI 当前执行：
 
 ## 发布说明
 
-`v1.5.0` 将 README 作为唯一主说明文档，并同步 Python 包版本、CLI 版本和 Docker 镜像默认版本。详细发布记录见 `RELEASE.md`。
+`v1.5.2` 改进 OpenAI 兼容端点稳定性：支持 `OPENAI_MODEL` 直接兜底、LLM 请求超时配置、框架元数据安全清洗，以及多 worker 在后续 LLM 失败时保留已有候选并继续全局最终复核。详细发布记录见 `RELEASE.md`。

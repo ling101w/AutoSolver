@@ -2,6 +2,6 @@
 
 from autosolver_agent.agent import AutoSolverLangChainAgent
 
-__version__ = "1.5.0"
+__version__ = "1.5.2"
 
 __all__ = ["AutoSolverLangChainAgent", "__version__"]

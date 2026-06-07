@@ -50,11 +50,12 @@ class LLMCodeGenerator:
         temperature: float = 0.2,
         llm: Any = None,
     ) -> None:
-        self.model = model or os.environ.get("AUTOSOLVER_LLM_MODEL") or "gpt-4o-mini"
+        self.model = model or os.environ.get("AUTOSOLVER_LLM_MODEL") or os.environ.get("OPENAI_MODEL") or "gpt-4o-mini"
         self.base_url = base_url or os.environ.get("OPENAI_BASE_URL") or os.environ.get("OPENAI_API_BASE")
         self.temperature = temperature
         self.wire_api = os.environ.get("AUTOSOLVER_WIRE_API") or os.environ.get("OPENAI_WIRE_API")
         self.reasoning_effort = os.environ.get("AUTOSOLVER_REASONING_EFFORT") or os.environ.get("OPENAI_REASONING_EFFORT")
+        self.request_timeout = _env_float("AUTOSOLVER_LLM_TIMEOUT", "OPENAI_TIMEOUT", "OPENAI_REQUEST_TIMEOUT", default=300.0)
         self.disable_response_storage = _env_bool("AUTOSOLVER_DISABLE_RESPONSE_STORAGE") or _env_bool(
             "OPENAI_DISABLE_RESPONSE_STORAGE"
         )
@@ -78,6 +79,8 @@ class LLMCodeGenerator:
         kwargs: Dict[str, Any] = {"model": self.model, "temperature": self.temperature}
         if self.base_url:
             kwargs["base_url"] = self.base_url
+        if self.request_timeout is not None:
+            kwargs["timeout"] = self.request_timeout
         if str(self.wire_api or "").lower() == "responses":
             kwargs["use_responses_api"] = True
         if self.reasoning_effort:
@@ -429,3 +432,18 @@ def _tool_message(content: str, tool_call_id: Optional[str], name: Optional[str]
 def _env_bool(name: str) -> bool:
     value = os.environ.get(name)
     return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_float(*names: str, default: Optional[float] = None) -> Optional[float]:
+    for name in names:
+        value = os.environ.get(name)
+        if value is None or not str(value).strip():
+            continue
+        try:
+            parsed = float(value)
+        except ValueError as exc:
+            raise RuntimeError(f"{name} must be a number.") from exc
+        if parsed <= 0:
+            raise RuntimeError(f"{name} must be greater than 0.")
+        return parsed
+    return default

@@ -1,13 +1,13 @@
 FROM python:3.10-slim AS runtime
 
-ARG VERSION=1.5.0
+ARG VERSION=1.5.2
 ARG VCS_REF=unknown
 
 LABEL org.opencontainers.image.title="AutoSolver Agent" \
       org.opencontainers.image.description="LangGraph/LangChain delivery assignment solver generation agent" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${VCS_REF}" \
-      org.opencontainers.image.source="https://github.com/ling101w/codex-" \
+      org.opencontainers.image.source="https://github.com/ling101w/AutoSolver" \
       org.opencontainers.image.licenses="UNLICENSED"
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
