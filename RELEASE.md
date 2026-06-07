@@ -1,5 +1,38 @@
 # Release Notes
 
+## v1.5.3
+
+发布日期：2026-06-07
+
+### 发布定位
+
+`v1.5.3` 是发布整理版本。它清理本地构建和运行产物，对齐开发环境要求。
+
+### 主要更新
+
+- Python 包、CLI 和 Docker 默认版本更新为 `1.5.3`。
+- 开发依赖加入 `build`，用于生成 wheel 和 sdist 发布包。
+- `.gitignore` 补充 `dist/`、`build/`、`.mypy_cache/`、`.ruff_cache/` 和 `.pytest_cache/`。
+- CI Docker smoke test 改用当前版本号。
+- GHCR 发布工作流改为 `main` 分支发布 `main` / `latest` 镜像，并继续支持 `v*` 标签发布。
+- 清理旧版本构建包、egg-info、缓存和运行产物，避免生成文件混入发布源码。
+
+### 发布产物
+
+- Python 包：`autosolver-agent==1.5.3`
+- CLI：`autosolver-agent --version` 输出 `autosolver-agent 1.5.3`
+- Docker 镜像建议标签：`autosolver-agent:1.5.3`
+
+### 验证清单
+
+```bash
+.venv/bin/ruff check .
+.venv/bin/mypy autosolver_agent
+.venv/bin/python -m unittest discover -s tests -v
+.venv/bin/python -m autosolver_agent.cli --version
+.venv/bin/python -m build
+```
+
 ## v1.5.2
 
 发布日期：2026-06-07

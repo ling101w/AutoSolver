@@ -1,6 +1,6 @@
 # AutoSolver Agent
 
-当前发布版本：`v1.5.2`
+当前发布版本：`v1.5.3`
 
 AutoSolver Agent 是一个面向配送分配问题的自动求解器生成系统。它基于 LangChain、LangGraph 和 OpenAI 兼容 LLM 接口，将实例分析、策略规划、候选代码生成、安全验证、评分、长期记忆和最终复核组织成一条可追踪的迭代工作流。
 
@@ -342,15 +342,15 @@ runs/autosolver_artifacts/worker_01/
 
 ```bash
 docker build \
-  --build-arg VERSION=1.5.2 \
+  --build-arg VERSION=1.5.3 \
   --build-arg VCS_REF="$(git rev-parse --short HEAD)" \
-  -t autosolver-agent:1.5.2 .
+  -t autosolver-agent:1.5.3 .
 ```
 
 查看版本：
 
 ```bash
-docker run --rm autosolver-agent:1.5.2 --version
+docker run --rm autosolver-agent:1.5.3 --version
 ```
 
 运行 case：
@@ -362,7 +362,7 @@ docker run --rm \
   -e AUTOSOLVER_LLM_MODEL="$AUTOSOLVER_LLM_MODEL" \
   -v "$PWD/examples:/app/examples:ro" \
   -v "$PWD/runs:/app/runs" \
-  autosolver-agent:1.5.2 \
+  autosolver-agent:1.5.3 \
   --cases examples/demo_case.txt \
   --out runs/docker/generated_submit_solution.py \
   --budget 90 \
@@ -389,6 +389,12 @@ mypy autosolver_agent
 ```bash
 python -m pip install -e .
 autosolver-agent --version
+```
+
+构建 Python 发布包：
+
+```bash
+python -m build
 ```
 
 CI 当前执行：
@@ -430,4 +436,4 @@ CI 当前执行：
 
 ## 发布说明
 
-`v1.5.2` 改进 OpenAI 兼容端点稳定性：支持 `OPENAI_MODEL` 直接兜底、LLM 请求超时配置、框架元数据安全清洗，以及多 worker 在后续 LLM 失败时保留已有候选并继续全局最终复核。详细发布记录见 `RELEASE.md`。
+`v1.5.3` 清理发布无关产物并对齐 GitHub 发布流程：`main` 分支触发 latest 镜像，CI Docker smoke test 使用当前版本，开发依赖包含构建工具。详细发布记录见 `RELEASE.md`。

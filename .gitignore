@@ -3,7 +3,12 @@ venv/
 env/
 __pycache__/
 *.py[cod]
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
 runs/
 .coverage
 *.egg-info/
+build/
+dist/
 .vscode/settings.json
