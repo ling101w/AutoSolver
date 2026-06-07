@@ -134,6 +134,7 @@ class AutoSolverWorkflow:
         self.baseline_imports: List[Dict[str, Any]] = []
         self.notes: List[str] = []
         self.final_solver_path: Optional[str] = None
+        self.worker_stop_reason: Optional[Dict[str, Any]] = None
         self._baseline_imported = False
         self.generation_service = GenerationService(self)
         self.evaluation_service = EvaluationService(self)
@@ -156,17 +157,37 @@ class AutoSolverWorkflow:
     ) -> Dict[str, Any]:
         self.iteration_stride = 1
         self._record_event("worker_started", phase="worker", iteration=first_iteration, context={"worker_id": worker_id})
-        state: WorkflowState = self._prepare_worker_loop(first_iteration)
-        while True:
-            state.update(self._node_generate(state))
-            state.update(self._node_validate_and_score(state))
-            if state.get("phase") == "finalize":
-                break
-            claimed = _claim_worker_iteration(iteration_counter, iteration_lock, max_iterations, self.deadline)
-            if claimed is None:
-                state = {"phase": "finalize", "iteration": int(state.get("iteration", first_iteration)), "stop_reason": "global iteration limit reached"}
-                break
-            state = {"phase": "generate", "iteration": claimed}
+        try:
+            state: WorkflowState = self._prepare_worker_loop(first_iteration)
+            while True:
+                state.update(self._node_generate(state))
+                state.update(self._node_validate_and_score(state))
+                if state.get("phase") == "finalize":
+                    break
+                claimed = _claim_worker_iteration(iteration_counter, iteration_lock, max_iterations, self.deadline)
+                if claimed is None:
+                    state = {"phase": "finalize", "iteration": int(state.get("iteration", first_iteration)), "stop_reason": "global iteration limit reached"}
+                    break
+                state = {"phase": "generate", "iteration": claimed}
+        except Exception as exc:
+            if not self.scores:
+                raise
+            iteration = int(state.get("iteration", first_iteration)) if "state" in locals() else first_iteration
+            phase = str(state.get("phase", "worker")) if "state" in locals() else "worker"
+            self.worker_stop_reason = {
+                "worker_id": worker_id,
+                "iteration": iteration,
+                "phase": phase,
+                "error": str(exc),
+                "action": "stopped_after_partial_results",
+            }
+            self._record_event(
+                "worker_stopped_on_error",
+                phase="worker",
+                iteration=iteration,
+                context=self.worker_stop_reason,
+            )
+            self.log(f"worker {worker_id}: stopped after partial results because {exc}")
         return self.report()
 
     def _build_graph(self) -> Any:
@@ -858,6 +879,7 @@ class AutoSolverWorkflow:
             "convergence": [score.convergence for score in self.scores],
             "impact_analysis": self.impact_analysis,
             "summary": self._summary(),
+            "worker_stop_reason": self.worker_stop_reason,
             "notes": self.notes,
         }
 

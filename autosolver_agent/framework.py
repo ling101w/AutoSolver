@@ -385,7 +385,7 @@ def parse_solver_framework(text_or_value: Any) -> SolverFramework:
     value = _load_json_like(text_or_value)
     if not isinstance(value, dict):
         raise FrameworkValidationError("framework response is not a JSON object")
-    framework = SolverFramework.model_validate(value.get("solver_framework", value))
+    framework = SolverFramework.model_validate(_sanitize_llm_payload(value.get("solver_framework", value)))
     _validate_safe_payload(framework.model_dump(mode="json"))
     return framework
 
@@ -394,7 +394,7 @@ def parse_instance_interpretation(text_or_value: Any) -> InstanceInterpretation:
     value = _load_json_like(text_or_value)
     if not isinstance(value, dict):
         raise FrameworkValidationError("instance interpretation response is not a JSON object")
-    interpretation = InstanceInterpretation.model_validate(value)
+    interpretation = InstanceInterpretation.model_validate(_sanitize_llm_payload(value))
     _validate_safe_payload(interpretation.model_dump(mode="json"))
     return interpretation
 
@@ -403,7 +403,7 @@ def parse_framework_update(text_or_value: Any) -> FrameworkUpdate:
     value = _load_json_like(text_or_value)
     if not isinstance(value, dict):
         raise FrameworkValidationError("framework update response is not a JSON object")
-    update = FrameworkUpdate.model_validate(value)
+    update = FrameworkUpdate.model_validate(_sanitize_llm_payload(value))
     _validate_safe_payload(update.model_dump(mode="json"))
     return update
 
@@ -460,6 +460,21 @@ def _validate_safe_payload(value: Any) -> None:
     if isinstance(value, dict):
         for item in value.values():
             _validate_safe_payload(item)
+
+
+def _sanitize_llm_payload(value: Any) -> Any:
+    """Clean unsafe-looking text snippets from LLM-owned framework metadata."""
+
+    if isinstance(value, str):
+        cleaned = value
+        for fragment in _DANGEROUS_FRAGMENTS:
+            cleaned = re.sub(re.escape(fragment), "[unsafe_reference]", cleaned, flags=re.IGNORECASE)
+        return cleaned
+    if isinstance(value, list):
+        return [_sanitize_llm_payload(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _sanitize_llm_payload(item) for key, item in value.items()}
+    return value
 
 
 def _framework_counts(framework: SolverFramework) -> Dict[str, int]:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import multiprocessing
 import os
 import tempfile
 import threading
@@ -10,16 +11,18 @@ import unittest
 from unittest.mock import patch
 
 from autosolver_agent import AutoSolverLangChainAgent
+from autosolver_agent.artifacts import ArtifactStore
 from autosolver_agent.caseio import CaseParseError, aggregate_features, dataset_features, load_cases, parse_case, score_answer
 from autosolver_agent.cli import build_parser
-from autosolver_agent.framework import FrameworkStore, FrameworkUpdate, FrameworkValidationError, SolverFramework
+from autosolver_agent.framework import FrameworkStore, FrameworkUpdate, FrameworkValidationError, SolverFramework, parse_solver_framework
+from autosolver_agent.llm import LLMCodeGenerator
 from autosolver_agent.llm.schema import parse_candidate_envelope
 from autosolver_agent.memory import MemoryStore
 from autosolver_agent.memory.store import MEMORY_SCHEMA_VERSION
 from autosolver_agent.models import Case, ScoreResult
 from autosolver_agent.runtime import run_candidate
 from autosolver_agent.tools import Validator
-from autosolver_agent.workflow.graph import _final_rank
+from autosolver_agent.workflow.graph import AutoSolverWorkflow, _final_rank
 from autosolver_agent.workflow.runner import AutoSolverRunConfig, AutoSolverRunner
 from solvers import seed_solvers
 
@@ -281,6 +284,17 @@ class ModularAgentTests(unittest.TestCase):
                     source="test_update",
                     iteration=2,
                 )
+
+    def test_framework_parser_sanitizes_llm_metadata_fragments(self):
+        payload = json.loads(structured_framework())
+        payload["strategies"][0]["implementation_notes"] = "Avoid import os and never call open('x') from solver code."
+
+        framework = parse_solver_framework(payload)
+
+        notes = framework.strategies[0].implementation_notes.lower()
+        self.assertNotIn("import os", notes)
+        self.assertNotIn("open(", notes)
+        self.assertIn("unsafe_reference", notes)
 
     def test_framework_update_sanitizes_unknown_skill_strategy_references(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -738,6 +752,48 @@ def solve(input_text: str) -> list:
             self.assertTrue(os.path.exists(config.output_path))
             self.assertEqual(report["best"]["name"], "worker_0_solver")
             self.assertEqual(len(report["worker_reports"]), 2)
+
+    def test_worker_loop_keeps_partial_report_after_later_llm_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            case = Case("case.txt", CASE_TEXT)
+            parsed = parse_case(CASE_TEXT)
+            workflow = AutoSolverWorkflow(
+                cases=[case],
+                parsed_cases=[parsed],
+                iterations=2,
+                deadline=time.time() + 20,
+                per_case_timeout=2,
+                search_per_case_timeout=1,
+                output_path=os.path.join(tmp, "generated_submit_solution.py"),
+                memory=MemoryStore(os.path.join(tmp, "memory")),
+                artifacts=ArtifactStore(os.path.join(tmp, "artifacts")),
+                llm=LLMCodeGenerator(
+                    llm=FakeLLM(
+                        plan_outputs=[structured_plan("partial_ok")],
+                        candidate_outputs=[structured_candidate("partial_solver")],
+                    )
+                ),
+                verbose=False,
+                finalize_top_k=1,
+                max_repair_attempts=0,
+                memory_top_k=1,
+                strategy_workers=1,
+            )
+            counter = multiprocessing.Value("i", 1)
+            lock = multiprocessing.Lock()
+
+            report = workflow.run_worker_loop(
+                worker_id=0,
+                first_iteration=1,
+                iteration_counter=counter,
+                iteration_lock=lock,
+                max_iterations=2,
+            )
+
+            self.assertEqual(report["iterations_completed"], 1)
+            self.assertIsNotNone(report["best"])
+            self.assertEqual(report["worker_stop_reason"]["iteration"], 2)
+            self.assertIn("no fake outputs left", report["worker_stop_reason"]["error"])
 
     def test_runner_detects_worker_exit_without_queue_report(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1199,6 +1255,47 @@ def solve(input_text: str) -> list:
                 os.environ["OPENAI_KEY"] = old_alt_key
             else:
                 os.environ.pop("OPENAI_KEY", None)
+
+    def test_llm_environment_uses_openai_model_and_timeout_aliases(self):
+        saved = {
+            name: os.environ.get(name)
+            for name in [
+                "OPENAI_API_KEY",
+                "OPENAI_KEY",
+                "AUTOSOLVER_LLM_MODEL",
+                "OPENAI_MODEL",
+                "OPENAI_BASE_URL",
+                "OPENAI_API_BASE",
+                "AUTOSOLVER_LLM_TIMEOUT",
+                "OPENAI_TIMEOUT",
+                "OPENAI_REQUEST_TIMEOUT",
+            ]
+        }
+        for name in saved:
+            os.environ.pop(name, None)
+        os.environ["OPENAI_KEY"] = "test-key"
+        os.environ["OPENAI_MODEL"] = "compat-model"
+        os.environ["OPENAI_BASE_URL"] = "https://example.invalid/v1"
+        os.environ["OPENAI_TIMEOUT"] = "12.5"
+        try:
+            from autosolver_agent.llm import LLMCodeGenerator
+
+            with patch("langchain_openai.ChatOpenAI") as chat_openai:
+                marker = object()
+                chat_openai.return_value = marker
+                generator = LLMCodeGenerator()
+
+            self.assertIs(generator.llm, marker)
+            kwargs = chat_openai.call_args.kwargs
+            self.assertEqual(kwargs["model"], "compat-model")
+            self.assertEqual(kwargs["base_url"], "https://example.invalid/v1")
+            self.assertEqual(kwargs["timeout"], 12.5)
+        finally:
+            for name, value in saved.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
 
     def test_cli_parses_new_agent_options(self):
         args = build_parser().parse_args(

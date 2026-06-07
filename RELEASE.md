@@ -1,5 +1,36 @@
 # Release Notes
 
+## v1.5.2
+
+发布日期：2026-06-07
+
+### 发布定位
+
+`v1.5.2` 是 OpenAI 兼容端点稳定性修复版本。它修复真实 LLM 长测中暴露的框架元数据安全校验过严、单次 LLM 请求无超时兜底，以及多 worker 在后续 LLM 失败时丢失已有候选结果的问题。
+
+### 主要更新
+
+- 新增 `AUTOSOLVER_LLM_TIMEOUT` / `OPENAI_TIMEOUT` / `OPENAI_REQUEST_TIMEOUT`，默认单次 LLM 请求超时为 `300` 秒。
+- 对 LLM 返回的 framework、instance interpretation 和 framework update 元数据执行递归文本清洗。
+- 保留存储层严格安全校验：手动构造或磁盘持久化的危险 framework payload 仍会被拒绝。
+- 多 worker 模式下，worker 在已经产生有效评分后遇到后续 LLM/API 错误时，会记录 `worker_stop_reason` 并返回已有 report，主进程可继续使用现有候选做全局最终复核。
+- README 同步更新 OpenAI 兼容环境变量和 v1.5.2 Docker 示例。
+
+### 发布产物
+
+- Python 包：`autosolver-agent==1.5.2`
+- CLI：`autosolver-agent --version` 输出 `autosolver-agent 1.5.2`
+- Docker 镜像建议标签：`autosolver-agent:1.5.2`
+
+### 验证清单
+
+```bash
+.venv/bin/ruff check .
+.venv/bin/mypy autosolver_agent
+.venv/bin/python -m unittest discover -s tests -v
+.venv/bin/python -m autosolver_agent.cli --version
+```
+
 ## v1.5.0
 
 发布日期：2026-06-07
