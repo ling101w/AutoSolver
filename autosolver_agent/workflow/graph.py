@@ -6,7 +6,7 @@ import os
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict, List, Optional, TypedDict
+from typing import Any, Callable, Dict, List, Optional, TypedDict
 
 from langgraph.graph import END as LANGGRAPH_END
 from langgraph.graph import StateGraph as LangGraphStateGraph
@@ -72,6 +72,7 @@ class AutoSolverWorkflow:
         strategy_workers: int = 1,
         summary_output_path: Optional[str] = None,
         event_log_path: Optional[str] = None,
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> None:
         self.cases = cases
         self.parsed_cases = parsed_cases
@@ -92,6 +93,7 @@ class AutoSolverWorkflow:
         self.strategy_workers = max(1, int(strategy_workers or 1))
         self.iteration_stride = 1
         self.summary_output_path = summary_output_path
+        self.progress_callback = progress_callback
         self.config = WorkflowConfig(
             iterations=self.iterations,
             deadline=self.deadline,
@@ -157,6 +159,7 @@ class AutoSolverWorkflow:
     ) -> Dict[str, Any]:
         self.iteration_stride = 1
         self._record_event("worker_started", phase="worker", iteration=first_iteration, context={"worker_id": worker_id})
+        self._emit_progress("started", "worker", first_iteration, worker_id=worker_id)
         try:
             state: WorkflowState = self._prepare_worker_loop(first_iteration)
             while True:
@@ -168,6 +171,7 @@ class AutoSolverWorkflow:
                 if claimed is None:
                     state = {"phase": "finalize", "iteration": int(state.get("iteration", first_iteration)), "stop_reason": "global iteration limit reached"}
                     break
+                self._emit_progress("claimed_iteration", "worker", claimed, worker_id=worker_id)
                 state = {"phase": "generate", "iteration": claimed}
         except Exception as exc:
             if not self.scores:
@@ -188,6 +192,8 @@ class AutoSolverWorkflow:
                 context=self.worker_stop_reason,
             )
             self.log(f"worker {worker_id}: stopped after partial results because {exc}")
+        completed_iteration = int(state.get("iteration", first_iteration)) if "state" in locals() else first_iteration
+        self._emit_progress("completed", "worker", completed_iteration, worker_id=worker_id)
         return self.report()
 
     def _build_graph(self) -> Any:
@@ -886,12 +892,14 @@ class AutoSolverWorkflow:
     def log(self, message: str) -> None:
         self.notes.append(message)
         self._record_event("log", phase="log", message=message)
-        if self.verbose:
+        self._emit_progress("log", "log", None, message=message, print_without_callback=False)
+        if self.verbose and self.progress_callback is None:
             print(f"[agent] {message}", flush=True)
 
     def _timed_node(self, phase: str, iteration: int, func: Any) -> WorkflowState:
         started = now_monotonic()
         self._record_event("phase_started", phase=phase, iteration=iteration)
+        self._emit_progress("enter", phase, iteration)
         try:
             result = func()
         except Exception as exc:
@@ -904,11 +912,55 @@ class AutoSolverWorkflow:
                 elapsed=elapsed,
                 context={"error": str(exc)},
             )
+            self._emit_progress("failed", phase, iteration, elapsed=elapsed, context={"error": str(exc)})
             raise
         elapsed = now_monotonic() - started
         self.run_state.timings.mark(phase, elapsed)
         self._record_event("phase_completed", phase=phase, iteration=iteration, elapsed=elapsed)
+        self._emit_progress("done", phase, iteration, elapsed=elapsed)
         return result
+
+    def _emit_progress(
+        self,
+        event: str,
+        phase: str,
+        iteration: Optional[int],
+        *,
+        worker_id: Optional[int] = None,
+        message: str = "",
+        elapsed: Optional[float] = None,
+        context: Optional[Dict[str, Any]] = None,
+        print_without_callback: bool = True,
+    ) -> None:
+        payload = {
+            "event": event,
+            "phase": phase,
+            "iteration": iteration,
+            "worker_id": worker_id,
+            "message": message,
+            "elapsed": round(elapsed, 3) if elapsed is not None else None,
+            "time_left": round(max(0.0, self.deadline - time.time()), 1),
+            "summary": self._progress_summary(),
+            "context": context or {},
+        }
+        if self.progress_callback is not None:
+            self.progress_callback(payload)
+            return
+        if self.verbose and print_without_callback:
+            print(_format_progress_line(payload), flush=True)
+
+    def _progress_summary(self) -> Dict[str, Any]:
+        return {
+            "iterations_completed": self._completed_iteration_count(),
+            "candidates_generated": self._generated_candidate_count(),
+            "valid_scores": len(self.scores),
+            "validation_failures": len(self.validation_errors),
+            "repairs_attempted": len(self.repair_history),
+            "best_candidate": self.best_candidate.name if self.best_candidate else None,
+            "best_penalty": round(self.best_score.total_penalty, 6) if self.best_score else None,
+            "best_covered": self.best_score.total_covered if self.best_score else None,
+            "best_tasks": self.best_score.total_tasks if self.best_score else None,
+        }
 
     def _record_event(
         self,
@@ -1257,6 +1309,71 @@ class AutoSolverWorkflow:
 
 def _final_rank(score: ScoreResult) -> tuple:
     return tuple(score.rank)
+
+
+def _format_progress_line(payload: Dict[str, Any]) -> str:
+    prefix = "[agent]"
+    worker_id = payload.get("worker_id")
+    if isinstance(worker_id, int):
+        prefix += f"[worker {worker_id:02d}]"
+
+    event = str(payload.get("event") or "progress")
+    phase = str(payload.get("phase") or "unknown")
+    message = str(payload.get("message") or "").strip()
+    if event == "log" and message:
+        action = message
+    elif event == "enter":
+        action = f"enter {phase}"
+    elif event == "done":
+        action = f"done {phase}"
+    elif event == "failed":
+        action = f"failed {phase}"
+    elif event == "claimed_iteration":
+        action = "claimed next iteration"
+    elif event == "started":
+        action = f"started {phase}"
+    elif event == "completed":
+        action = f"completed {phase}"
+    else:
+        action = f"{event} {phase}"
+
+    details = []
+    iteration = payload.get("iteration")
+    if iteration is not None:
+        details.append(f"iter={iteration}")
+    elapsed = payload.get("elapsed")
+    if isinstance(elapsed, (int, float)):
+        details.append(f"{float(elapsed):.3f}s")
+    time_left = payload.get("time_left")
+    if isinstance(time_left, (int, float)):
+        details.append(f"left={float(time_left):.1f}s")
+
+    summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else {}
+    summary_parts = []
+    if "iterations_completed" in summary:
+        summary_parts.append(f"done={summary.get('iterations_completed')}")
+    if "candidates_generated" in summary:
+        summary_parts.append(f"cand={summary.get('candidates_generated')}")
+    if "valid_scores" in summary:
+        summary_parts.append(f"scores={summary.get('valid_scores')}")
+    if summary.get("validation_failures"):
+        summary_parts.append(f"fail={summary.get('validation_failures')}")
+    if summary.get("repairs_attempted"):
+        summary_parts.append(f"repairs={summary.get('repairs_attempted')}")
+    if summary.get("best_candidate"):
+        covered = summary.get("best_covered")
+        tasks = summary.get("best_tasks")
+        penalty = summary.get("best_penalty")
+        best = f"best={summary.get('best_candidate')}"
+        if covered is not None and tasks is not None:
+            best += f" {covered}/{tasks}"
+        if penalty is not None:
+            best += f" p={penalty}"
+        summary_parts.append(best)
+
+    suffix_parts = details + summary_parts
+    suffix = " | " + " ".join(suffix_parts) if suffix_parts else ""
+    return f"{prefix} {action}{suffix}"
 
 
 def _unique_strings(values: List[Any]) -> List[str]:

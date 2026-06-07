@@ -1,6 +1,6 @@
 # AutoSolver Agent
 
-当前发布版本：`v1.5.3`
+当前发布版本：`v1.5.4`
 
 AutoSolver Agent 是一个面向配送分配问题的自动求解器生成系统。它基于 LangChain、LangGraph 和 OpenAI 兼容 LLM 接口，将实例分析、策略规划、候选代码生成、安全验证、评分、长期记忆和最终复核组织成一条可追踪的迭代工作流。
 
@@ -12,6 +12,7 @@ AutoSolver Agent 是一个面向配送分配问题的自动求解器生成系统
 - LangGraph 工作流：核心链路为 `classify -> generate -> validate_and_score -> finalize`。
 - LangChain 工具化规划：规划阶段可读取实例特征、求解框架、相似历史实验、UCB bandit 推荐和当前最佳 artifact 摘要。
 - 多策略并行：`--strategy-workers` 为 1 时在当前进程运行，2 个以上时可启动独立 worker 进程并全局复评最优候选。
+- 实时进度输出：verbose 模式下终端会显示每个 worker、每一轮和每个阶段的进入、完成、耗时、剩余预算和当前摘要。
 - 基线 solver 导入：可通过 `--baseline-solver` 或 `--base-solver` 将已有 `.py` solver 纳入同一验证、评分和最终候选池。
 - 验证与修复闭环：结构化输出失败或候选验证失败后，可由 LLM 在受控次数内修复。
 - 子进程沙箱：候选代码在独立进程中执行，受 import 白名单、危险调用检查、CPU 时间和内存限制保护。
@@ -342,15 +343,15 @@ runs/autosolver_artifacts/worker_01/
 
 ```bash
 docker build \
-  --build-arg VERSION=1.5.3 \
+  --build-arg VERSION=1.5.4 \
   --build-arg VCS_REF="$(git rev-parse --short HEAD)" \
-  -t autosolver-agent:1.5.3 .
+  -t autosolver-agent:1.5.4 .
 ```
 
 查看版本：
 
 ```bash
-docker run --rm autosolver-agent:1.5.3 --version
+docker run --rm autosolver-agent:1.5.4 --version
 ```
 
 运行 case：
@@ -362,7 +363,7 @@ docker run --rm \
   -e AUTOSOLVER_LLM_MODEL="$AUTOSOLVER_LLM_MODEL" \
   -v "$PWD/examples:/app/examples:ro" \
   -v "$PWD/runs:/app/runs" \
-  autosolver-agent:1.5.3 \
+  autosolver-agent:1.5.4 \
   --cases examples/demo_case.txt \
   --out runs/docker/generated_submit_solution.py \
   --budget 90 \
@@ -436,4 +437,4 @@ CI 当前执行：
 
 ## 发布说明
 
-`v1.5.3` 清理发布无关产物并对齐 GitHub 发布流程：`main` 分支触发 latest 镜像，CI Docker smoke test 使用当前版本，开发依赖包含构建工具。详细发布记录见 `RELEASE.md`。
+`v1.5.4` 增强长时间运行的可观测性：verbose 模式下会把每个 worker、每轮迭代和关键阶段的实时进度摘要输出到终端，`--quiet` 仍保持静默。详细发布记录见 `RELEASE.md`。

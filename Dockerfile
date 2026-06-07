@@ -1,6 +1,6 @@
 FROM python:3.10-slim AS runtime
 
-ARG VERSION=1.5.3
+ARG VERSION=1.5.4
 ARG VCS_REF=unknown
 
 LABEL org.opencontainers.image.title="AutoSolver Agent" \

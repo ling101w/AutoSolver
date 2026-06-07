@@ -1,5 +1,36 @@
 # Release Notes
 
+## v1.5.4
+
+发布日期：2026-06-07
+
+### 发布定位
+
+`v1.5.4` 是多 worker 可观测性增强版本。它把每轮、每个 worker 和关键阶段的当前进度摘要实时输出到终端，便于长时间运行时观察 agent 正在哪一步。
+
+### 主要更新
+
+- Python 包、CLI、Docker 默认版本、CI Docker smoke test 和 GHCR 发布工作流版本更新为 `1.5.4`。
+- `AutoSolverWorkflow` 新增 progress callback，在 `classify`、`generate`、`validate_and_score`、`finalize` 等阶段进入、完成和失败时生成进度摘要。
+- 多进程 worker 通过主进程队列上报 progress 事件，由主进程统一打印 worker id、iteration、phase、耗时、剩余预算、候选数量、有效评分数量和当前 best，避免子进程终端输出交错。
+- worker loop 会在启动、领取下一轮和完成时报告状态；多 worker 全局最终复核也会输出候选复核进度。
+- `--quiet` 继续关闭终端进度输出，事件日志和 report 行为保持兼容。
+- 新增 worker progress 输出单元测试，覆盖 progress 队列消息不会被误当成 worker report。
+
+### 发布产物
+
+- Python 包：`autosolver-agent==1.5.4`
+- CLI：`autosolver-agent --version` 输出 `autosolver-agent 1.5.4`
+- Docker 镜像建议标签：`autosolver-agent:1.5.4`
+
+### 验证清单
+
+```bash
+.venv/bin/ruff check autosolver_agent/workflow/graph.py autosolver_agent/workflow/runner.py tests/test_modular_agent.py
+.venv/bin/python -m unittest
+.venv/bin/autosolver-agent --version
+```
+
 ## v1.5.3
 
 发布日期：2026-06-07

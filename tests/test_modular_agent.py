@@ -753,6 +753,112 @@ def solve(input_text: str) -> list:
             self.assertEqual(report["best"]["name"], "worker_0_solver")
             self.assertEqual(len(report["worker_reports"]), 2)
 
+    def test_runner_prints_worker_progress_messages(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            case = Case("case.txt", CASE_TEXT)
+            parsed = parse_case(CASE_TEXT)
+
+            def fake_worker_entry(worker_id, iteration_counter, iteration_lock, cases, parsed_cases, config, queue):
+                worker_dir = os.path.join(config.artifact_dir, f"worker_{worker_id:02d}")
+                os.makedirs(worker_dir, exist_ok=True)
+                code_path = os.path.join(worker_dir, f"worker_{worker_id}_solver.py")
+                with open(code_path, "w", encoding="utf-8") as handle:
+                    handle.write(VALID_SOLVER)
+                queue.put(
+                    (
+                        "progress",
+                        {
+                            "worker_id": worker_id,
+                            "event": "enter",
+                            "phase": "generate",
+                            "iteration": 1,
+                            "time_left": 9.5,
+                            "summary": {
+                                "iterations_completed": 0,
+                                "candidates_generated": 0,
+                                "valid_scores": 0,
+                            },
+                        },
+                    )
+                )
+                queue.put(
+                    (
+                        "ok",
+                        {
+                            "worker_id": worker_id,
+                            "iterations_completed": 1,
+                            "artifacts": [
+                                {
+                                    "iteration": 1,
+                                    "candidate_name": f"worker_{worker_id}_solver",
+                                    "code_path": code_path,
+                                }
+                            ],
+                            "experiments": [
+                                {
+                                    "iteration": 1,
+                                    "candidate": f"worker_{worker_id}_solver",
+                                    "strategy": ["risk_balanced_cover"],
+                                    "params": {},
+                                    "score": {
+                                        "rank": [0, -2, 30.0, 0.01],
+                                        "covered": 2,
+                                        "tasks": 2,
+                                        "penalty": 30.0,
+                                        "runtime": 0.01,
+                                        "failures": 0,
+                                    },
+                                }
+                            ],
+                        },
+                    )
+                )
+
+            def fake_finalize_score(self, candidate, cases, parsed_cases, best=None, timeout=None):
+                return ScoreResult(
+                    name=candidate.name,
+                    rank=(0, -2, 30.0, 0.01),
+                    total_covered=2,
+                    total_tasks=2,
+                    total_penalty=30.0,
+                    total_runtime=0.01,
+                    failures=0,
+                    cases=[],
+                )
+
+            config = AutoSolverRunConfig(
+                iterations=2,
+                deadline=time.time() + 10,
+                per_case_timeout=2,
+                search_per_case_timeout=1,
+                output_path=os.path.join(tmp, "generated_submit_solution.py"),
+                memory_dir=os.path.join(tmp, "memory"),
+                artifact_dir=os.path.join(tmp, "artifacts"),
+                llm_model=None,
+                llm_base_url=None,
+                verbose=True,
+                finalize_top_k=1,
+                max_repair_attempts=0,
+                memory_top_k=1,
+                bandit_exploration=1.4,
+                strategy_workers=2,
+                summary_output_path=None,
+                event_log_path=None,
+            )
+            with patch("autosolver_agent.workflow.runner.LLMCodeGenerator.validate_environment"), patch(
+                "autosolver_agent.workflow.runner._worker_entry",
+                side_effect=fake_worker_entry,
+            ), patch(
+                "autosolver_agent.workflow.runner.Scorer.score",
+                new=fake_finalize_score,
+            ), patch("sys.stdout", new_callable=io.StringIO) as stdout:
+                report = AutoSolverRunner([case], [parsed], config).run()
+
+            output = stdout.getvalue()
+            self.assertIn("[agent][worker 00] enter generate", output)
+            self.assertIn("done=0 cand=0 scores=0", output)
+            self.assertEqual(report["iterations_completed"], 2)
+
     def test_worker_loop_keeps_partial_report_after_later_llm_error(self):
         with tempfile.TemporaryDirectory() as tmp:
             case = Case("case.txt", CASE_TEXT)

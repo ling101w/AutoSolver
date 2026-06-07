@@ -16,7 +16,7 @@ from autosolver_agent.llm import LLMCodeGenerator
 from autosolver_agent.memory import MemoryStore
 from autosolver_agent.models import Candidate, Case, ParsedCase, ScoreResult
 from autosolver_agent.tools import Scorer
-from autosolver_agent.workflow.graph import AutoSolverWorkflow, _final_rank
+from autosolver_agent.workflow.graph import AutoSolverWorkflow, _final_rank, _format_progress_line
 
 
 @dataclass
@@ -101,6 +101,8 @@ class AutoSolverRunner:
         iteration_lock = multiprocessing.Lock()
         queue: multiprocessing.Queue = multiprocessing.Queue()
         processes = []
+        if self.config.verbose:
+            print(f"[agent] starting {worker_count} worker processes", flush=True)
         for worker_id in range(worker_count):
             process = multiprocessing.Process(
                 target=_worker_entry,
@@ -138,12 +140,13 @@ class AutoSolverRunner:
 
             try:
                 kind, payload = queue.get(timeout=min(0.25, max(0.01, remaining)))
-                _record_worker_result(kind, payload, worker_reports, errors, pending)
-                dead_since.pop(int(payload.get("worker_id", -1)) if isinstance(payload, dict) else -1, None)
+                _handle_worker_message(kind, payload, worker_reports, errors, pending, self.config.verbose)
+                if kind != "progress":
+                    dead_since.pop(int(payload.get("worker_id", -1)) if isinstance(payload, dict) else -1, None)
             except queue_module.Empty:
                 pass
 
-            _drain_worker_queue(queue, worker_reports, errors, pending, dead_since)
+            _drain_worker_queue(queue, worker_reports, errors, pending, dead_since, self.config.verbose)
             now = time.time()
             for worker_id, process in list(pending.items()):
                 if process.is_alive() or process.exitcode is None:
@@ -187,6 +190,8 @@ class AutoSolverRunner:
         candidates = _candidate_refs(worker_reports, self.config.finalize_top_k)
         best_pair: Optional[tuple[ScoreResult, str, Dict[str, Any]]] = None
         scorer = Scorer(per_case_timeout=self.config.per_case_timeout)
+        if self.config.verbose:
+            print(f"[agent] finalizing global best from {len(candidates)} worker candidates", flush=True)
         for item in candidates:
             code_path = item.get("code_path")
             if not code_path:
@@ -207,6 +212,12 @@ class AutoSolverRunner:
                 best=best_pair[0] if best_pair else None,
                 timeout=self.config.per_case_timeout,
             )
+            if self.config.verbose:
+                print(
+                    f"[agent] finalize recheck worker={item.get('worker_id')} candidate={candidate.name} "
+                    f"covered={score.total_covered}/{score.total_tasks} penalty={score.total_penalty:.4f}",
+                    flush=True,
+                )
             if best_pair is None or _final_rank(score) < _final_rank(best_pair[0]):
                 best_pair = (score, code, item)
 
@@ -268,20 +279,36 @@ def _record_worker_result(
         errors.append(payload)
 
 
+def _handle_worker_message(
+    kind: Any,
+    payload: Any,
+    worker_reports: List[Dict[str, Any]],
+    errors: List[Dict[str, Any]],
+    pending: Dict[int, multiprocessing.Process],
+    verbose: bool,
+) -> None:
+    if kind == "progress":
+        if verbose and isinstance(payload, dict):
+            print(_format_progress_line(payload), flush=True)
+        return
+    _record_worker_result(kind, payload, worker_reports, errors, pending)
+
+
 def _drain_worker_queue(
     result_queue: multiprocessing.Queue,
     worker_reports: List[Dict[str, Any]],
     errors: List[Dict[str, Any]],
     pending: Dict[int, multiprocessing.Process],
     dead_since: Dict[int, float],
+    verbose: bool,
 ) -> None:
     while True:
         try:
             kind, payload = result_queue.get_nowait()
         except queue_module.Empty:
             return
-        _record_worker_result(kind, payload, worker_reports, errors, pending)
-        if isinstance(payload, dict) and isinstance(payload.get("worker_id"), int):
+        _handle_worker_message(kind, payload, worker_reports, errors, pending, verbose)
+        if kind != "progress" and isinstance(payload, dict) and isinstance(payload.get("worker_id"), int):
             dead_since.pop(payload["worker_id"], None)
 
 
@@ -305,8 +332,20 @@ def _worker_entry(
     queue: multiprocessing.Queue,
 ) -> None:
     try:
+        progress_callback = _worker_progress_callback(queue, worker_id) if config.verbose else None
         first_iteration = _claim_iteration(iteration_counter, iteration_lock, config.iterations, config.deadline)
         if first_iteration is None:
+            if progress_callback is not None:
+                progress_callback(
+                    {
+                        "event": "completed",
+                        "phase": "worker",
+                        "iteration": None,
+                        "message": "no iteration available",
+                        "summary": {"iterations_completed": 0, "candidates_generated": 0, "valid_scores": 0},
+                        "time_left": round(max(0.0, config.deadline - time.time()), 1),
+                    }
+                )
             queue.put(
                 (
                     "ok",
@@ -349,6 +388,7 @@ def _worker_entry(
             strategy_workers=1,
             summary_output_path=None,
             event_log_path=event_log_path,
+            progress_callback=progress_callback,
         )
         report = workflow.run_worker_loop(
             worker_id=worker_id,
@@ -370,6 +410,15 @@ def _worker_entry(
                 },
             )
         )
+
+
+def _worker_progress_callback(result_queue: multiprocessing.Queue, worker_id: int) -> Any:
+    def emit(payload: Dict[str, Any]) -> None:
+        item = dict(payload)
+        item["worker_id"] = worker_id
+        result_queue.put(("progress", item))
+
+    return emit
 
 
 def _claim_iteration(

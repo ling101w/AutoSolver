@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "autosolver-agent"
-version = "1.5.3"
+version = "1.5.4"
 description = "LangGraph/LangChain AutoSolver Agent for delivery assignment solver generation."
 readme = "README.md"
 requires-python = ">=3.10"
