@@ -41,7 +41,7 @@ class AutoSolverLangChainAgent:
         self.output_path = output_path
         self.budget_seconds = budget_seconds
         self.per_case_timeout = per_case_timeout
-        self.search_per_case_timeout = search_per_case_timeout or per_case_timeout
+        self.search_per_case_timeout = per_case_timeout if search_per_case_timeout is None else search_per_case_timeout
         self.iterations = iterations
         self.memory_dir = memory_dir
         self.artifact_dir = artifact_dir
@@ -60,8 +60,7 @@ class AutoSolverLangChainAgent:
         self.event_log_path = event_log_path
 
     def run(self) -> Dict[str, Any]:
-        if self.strategy_workers < 1:
-            raise RuntimeError("AutoSolver Agent requires strategy_workers >= 1.")
+        self._validate_config()
         paths = self.case_paths or discover_case_paths(os.getcwd())
         cases = load_cases(paths, self.max_cases)
         if not cases:
@@ -101,3 +100,26 @@ class AutoSolverLangChainAgent:
 
     def run_json(self) -> str:
         return json.dumps(self.run(), indent=2, ensure_ascii=False, sort_keys=True)
+
+    def _validate_config(self) -> None:
+        checks = [
+            ("budget_seconds", self.budget_seconds, 0, False),
+            ("per_case_timeout", self.per_case_timeout, 0, False),
+            ("search_per_case_timeout", self.search_per_case_timeout, 0, False),
+            ("iterations", self.iterations, 1, True),
+            ("max_cases", self.max_cases, 1, True),
+            ("finalize_top_k", self.finalize_top_k, 1, True),
+            ("max_repair_attempts", self.max_repair_attempts, 0, True),
+            ("memory_top_k", self.memory_top_k, 1, True),
+            ("bandit_exploration", self.bandit_exploration, 0, True),
+            ("strategy_workers", self.strategy_workers, 1, True),
+        ]
+        for name, value, minimum, inclusive in checks:
+            if inclusive:
+                valid = value >= minimum
+                op = ">="
+            else:
+                valid = value > minimum
+                op = ">"
+            if not valid:
+                raise RuntimeError(f"AutoSolver Agent requires {name} {op} {minimum}.")

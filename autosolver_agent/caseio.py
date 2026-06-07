@@ -38,13 +38,15 @@ def _parse_case_with_diagnostics(
     by_key: DefaultDict[str, Dict[str, Tuple[float, float]]] = defaultdict(dict)
     key_tasks: Dict[str, Tuple[str, ...]] = {}
     diagnostics: List[ParseDiagnostic] = []
+    content_line = 0
     for line_number, raw_line in enumerate(text.strip().splitlines(), start=1):
         stripped = raw_line.strip()
         if not stripped:
             continue
-        if stripped.startswith("task_id_list"):
-            continue
+        content_line += 1
         parts = raw_line.rstrip("\r\n").split("\t")
+        if content_line == 1 and _is_header_row(parts):
+            continue
         if len(parts) < 4:
             diagnostics.append(
                 _diagnostic(
@@ -113,6 +115,10 @@ def _parse_case_with_diagnostics(
         all_couriers=all_couriers,
     )
     return parsed, diagnostics
+
+
+def _is_header_row(parts: List[str]) -> bool:
+    return [part.strip() for part in parts[:4]] == ["task_id_list", "courier_id", "total_score", "willingness"]
 
 
 def load_cases(paths: Iterable[str], max_cases: int) -> List[Case]:

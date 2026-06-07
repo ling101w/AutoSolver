@@ -422,12 +422,14 @@ class AutoSolverWorkflow:
         validations = self._validate_candidates(candidates)
         final_items: List[CandidateEvaluationItem] = []
         for candidate, validation in zip(candidates, validations):
+            final_items.append({"candidate": candidate, "validation": validation, "score": None, "impact": None})
             if not validation.valid and self.max_repair_attempts > 0:
                 repaired = self.repair_service.repair_validation_failure(iteration, state, candidate, validation)
                 if repaired is not candidate:
-                    candidate = repaired
-                    validation = self.validator.validate(candidate.code, self.cases, self.parsed_cases)
-            final_items.append({"candidate": candidate, "validation": validation, "score": None, "impact": None})
+                    repaired_validation = self.validator.validate(repaired.code, self.cases, self.parsed_cases)
+                    final_items.append(
+                        {"candidate": repaired, "validation": repaired_validation, "score": None, "impact": None}
+                    )
 
         valid_items = [item for item in final_items if item["validation"].valid]
         if valid_items:
@@ -1100,6 +1102,7 @@ class AutoSolverWorkflow:
         state: WorkflowState,
         final_items: List[CandidateEvaluationItem],
     ) -> None:
+        update = None
         try:
             plans = [model_dump(plan) for plan in list(state.get("plans") or ([state["plan"]] if state.get("plan") is not None else []))]
             evaluations = [self._evaluation_summary(item) for item in final_items]
@@ -1117,6 +1120,40 @@ class AutoSolverWorkflow:
             self.instance_features["solver_framework"] = self.framework_store.snapshot()
             self._record_event("framework_updated", phase="validate_and_score", iteration=iteration, context=applied)
         except Exception as exc:
+            if update is not None:
+                try:
+                    sanitized, sanitation = self.framework_store.sanitize_update(update)
+                    if sanitation.get("changed"):
+                        applied = self.framework_store.apply_update(
+                            sanitized,
+                            source="llm_reflection_sanitized",
+                            iteration=iteration,
+                        )
+                        applied["sanitation"] = sanitation
+                        self.framework_updates.append({"iteration": iteration, **applied})
+                        self.instance_features["solver_framework"] = self.framework_store.snapshot()
+                        self._record_event(
+                            "framework_updated_sanitized",
+                            phase="validate_and_score",
+                            iteration=iteration,
+                            context=applied,
+                        )
+                        return
+                except Exception as sanitize_exc:
+                    failure = {
+                        "iteration": iteration,
+                        "action": "framework_update_rejected",
+                        "error": str(exc),
+                        "sanitize_error": str(sanitize_exc),
+                    }
+                    self.framework_updates.append(failure)
+                    self._record_event(
+                        "framework_update_rejected",
+                        phase="validate_and_score",
+                        iteration=iteration,
+                        context=failure,
+                    )
+                    return
             failure = {"iteration": iteration, "action": "framework_update_rejected", "error": str(exc)}
             self.framework_updates.append(failure)
             self._record_event("framework_update_rejected", phase="validate_and_score", iteration=iteration, context=failure)
@@ -1197,7 +1234,7 @@ class AutoSolverWorkflow:
 
 
 def _final_rank(score: ScoreResult) -> tuple:
-    return (score.failures, -score.total_covered, score.total_penalty)
+    return tuple(score.rank)
 
 
 def _unique_strings(values: List[Any]) -> List[str]:

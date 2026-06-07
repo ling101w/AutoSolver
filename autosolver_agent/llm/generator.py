@@ -26,6 +26,7 @@ from autosolver_agent.llm.schema import (
     plan_schema_text,
 )
 from autosolver_agent.models import Candidate
+from autosolver_agent.runtime import SAFE_IMPORT_ROOTS
 from autosolver_agent.tools.langchain_tools import PlannerToolbox, build_langchain_tools
 
 SOLVER_OUTPUT_CONTRACT = (
@@ -36,6 +37,7 @@ SOLVER_OUTPUT_CONTRACT = (
     "Do not return (task_id_list, courier_id) pairs with a bare string courier. "
     "Do not return dictionaries, row objects, nested lists of multiple solutions, scores, or metadata."
 )
+ALLOWED_IMPORT_ROOTS_TEXT = ", ".join(name for name in sorted(SAFE_IMPORT_ROOTS) if name != "__future__")
 
 
 class LLMCodeGenerator:
@@ -163,14 +165,17 @@ class LLMCodeGenerator:
             "Objective case features:\n{features}\n\n"
             "Memory digest:\n{memory}\n\n"
             "Input case samples:\n{samples}\n\n"
-            "Create feature_dimensions, strategies, and skills that are useful for generating standard-library "
+            "Create feature_dimensions, strategies, and skills that are useful for generating safe, self-contained "
             "solve(input_text: str) implementations that obey this output contract:\n{contract}\n\n"
+            "Candidate code may only import from these validator-approved roots: {allowed_imports}. "
+            "Optional non-standard-library imports must be guarded with deterministic fallbacks.\n\n"
             "Do not propose changes to validator, scorer, runtime, parser, or the output contract."
         ).format(
             features=_json(objective_features),
             memory=_json(memory_digest),
             samples="\n\n---\n\n".join(case_samples),
             contract=SOLVER_OUTPUT_CONTRACT,
+            allowed_imports=ALLOWED_IMPORT_ROOTS_TEXT,
         )
         return parse_solver_framework(self._invoke(system, user))
 
@@ -259,10 +264,12 @@ class LLMCodeGenerator:
     ) -> Candidate:
         system = (
             "You are AutoSolver Agent's code generator. Generate one complete Python solver. "
-            "The solver must use only Python standard library, define solve(input_text: str) -> list, "
+            "The solver must define solve(input_text: str) -> list, "
             "and obey this output contract:\n"
             + SOLVER_OUTPUT_CONTRACT
             + "\n"
+            f"Candidate code may only import from these validator-approved roots: {ALLOWED_IMPORT_ROOTS_TEXT}. "
+            "Optional non-standard-library imports must be guarded with deterministic fallbacks. "
             "Do not use file IO, network IO, subprocess, eval, exec, compile, or dynamic imports. "
             "The standard-library time module is allowed for lightweight runtime guards, but candidate code must still "
             "remain bounded by the external runtime limits. "
@@ -328,8 +335,10 @@ class LLMCodeGenerator:
         system = (
             "You repair AutoSolver candidate solvers. Return exactly one JSON object matching this "
             "CandidateEnvelope schema. Use the LLM-maintained solver framework when fixing construction, "
-            "coverage repair, or search issues, while keeping the solver self-contained. The standard-library time "
-            "module is allowed, but do not add unsafe imports or change the solve() contract. "
+            "coverage repair, or search issues, while keeping the solver self-contained. "
+            f"Allowed import roots are: {ALLOWED_IMPORT_ROOTS_TEXT}. Optional non-standard-library imports must have "
+            "deterministic fallbacks. The standard-library time module is allowed, but do not add unsafe imports "
+            "or change the solve() contract. "
             "The repaired code must obey this output contract:\n"
             + SOLVER_OUTPUT_CONTRACT
             + "\n"
@@ -350,7 +359,8 @@ class LLMCodeGenerator:
             "LLM-maintained solver framework:\n{solvers}\n\n"
             "Input case samples:\n{samples}\n\n"
             "Output contract:\n{contract}\n\n"
-            "Keep solve() standard-library only and efficient for an external {timeout:.2f}s per-case judge. "
+            "Keep solve() within the validator-approved import policy and efficient for an external "
+            "{timeout:.2f}s per-case judge. "
             "Prefer deterministic input-size bounds; time-based cutoffs may be used as secondary guards."
         ).format(
             attempt=attempt,

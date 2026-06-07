@@ -23,7 +23,9 @@ if [[ -z "${PYTHON_BIN:-}" ]]; then
   fi
 fi
 
-export OPENAI_API_KEY='sk-43e5bfbadc07b1549f21062fa230e6e29bdbef25dcd640f631a73f9fb282ff1a'
+if [[ -z "${OPENAI_API_KEY:-}" && -n "${OPENAI_KEY:-}" ]]; then
+  export OPENAI_API_KEY="$OPENAI_KEY"
+fi
 
 if [[ -z "${OPENAI_API_KEY:-}" ]]; then
   echo "OPENAI_API_KEY is not set." >&2
@@ -32,14 +34,14 @@ if [[ -z "${OPENAI_API_KEY:-}" ]]; then
   exit 1
 fi
 
-export OPENAI_BASE_URL="${OPENAI_BASE_URL:-https://nasyh.cyou/v1}"
+export OPENAI_BASE_URL="${OPENAI_BASE_URL:-${OPENAI_API_BASE:-https://api.openai.com/v1}}"
 export OPENAI_API_BASE="${OPENAI_API_BASE:-$OPENAI_BASE_URL}"
-export AUTOSOLVER_LLM_MODEL="${AUTOSOLVER_LLM_MODEL:-${OPENAI_MODEL:-gpt-5.5}}"
+export AUTOSOLVER_LLM_MODEL="${AUTOSOLVER_LLM_MODEL:-${OPENAI_MODEL:-gpt-4o-mini}}"
 export OPENAI_MODEL="$AUTOSOLVER_LLM_MODEL"
 
 cases=("$@")
 if [[ ${#cases[@]} -eq 0 ]]; then
-  cases=(examples/demo_case.txt)
+  cases=(examples/large_seed301.txt)
 fi
 
 mkdir -p runs/manual

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 import tempfile
@@ -18,6 +19,7 @@ from autosolver_agent.memory.store import MEMORY_SCHEMA_VERSION
 from autosolver_agent.models import Case, ScoreResult
 from autosolver_agent.runtime import run_candidate
 from autosolver_agent.tools import Validator
+from autosolver_agent.workflow.graph import _final_rank
 from autosolver_agent.workflow.runner import AutoSolverRunConfig, AutoSolverRunner
 from solvers import seed_solvers
 
@@ -280,6 +282,41 @@ class ModularAgentTests(unittest.TestCase):
                     iteration=2,
                 )
 
+    def test_framework_update_sanitizes_unknown_skill_strategy_references(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = FrameworkStore(tmp)
+            store.bootstrap(SolverFramework.model_validate(json.loads(structured_framework())), source="test_bootstrap")
+            update = FrameworkUpdate.model_validate(
+                {
+                    "update_reason": "Keep usable framework update fragments.",
+                    "skills": [
+                        {
+                            "name": "mixed_skill",
+                            "strategy_names": ["risk_balanced_cover", "missing_strategy"],
+                            "construction_notes": "Reuse the known strategy and drop unknown references.",
+                            "code_contract": "solve(input_text: str) -> list",
+                            "constraints": ["No duplicate tasks."],
+                        },
+                        {
+                            "name": "orphan_skill",
+                            "strategy_names": ["missing_strategy"],
+                            "construction_notes": "This skill has no valid strategy anchor.",
+                            "code_contract": "solve(input_text: str) -> list",
+                            "constraints": ["No duplicate tasks."],
+                        },
+                    ],
+                }
+            )
+
+            sanitized, details = store.sanitize_update(update)
+            self.assertTrue(details["changed"])
+            self.assertEqual(details["dropped_skills"], ["orphan_skill"])
+            store.apply_update(sanitized, source="test_update_sanitized", iteration=3)
+
+            skills = {skill.name: skill for skill in store.framework.skills}
+            self.assertEqual(skills["mixed_skill"].strategy_names, ["risk_balanced_cover"])
+            self.assertNotIn("orphan_skill", skills)
+
     def test_seed_solvers_are_directly_callable_and_valid(self):
         parsed = parse_case(CASE_TEXT)
         for name, solver in seed_solvers.SEED_SOLVERS.items():
@@ -301,6 +338,31 @@ class ModularAgentTests(unittest.TestCase):
         result = validator.validate(duplicate, [Case("case.txt", CASE_TEXT)], [parsed])
         self.assertFalse(result.valid)
         self.assertEqual(result.errors[0]["type"], "invalid_output")
+
+    def test_validator_checks_all_cases_by_default(self):
+        first = parse_case(CASE_TEXT)
+        second_text = """task_id_list\tcourier_id\ttotal_score\twillingness
+x0\tcx0\t10\t0.8
+"""
+        second = parse_case(second_text)
+        code = "def solve(input_text: str):\n    return [('t0', ['c0'])]\n"
+        validator = Validator(smoke_timeout=1.0)
+
+        smoke = validator.validate(
+            code,
+            [Case("first.txt", CASE_TEXT), Case("second.txt", second_text)],
+            [first, second],
+            max_cases=1,
+        )
+        self.assertTrue(smoke.valid, smoke.errors)
+
+        full = validator.validate(code, [Case("first.txt", CASE_TEXT), Case("second.txt", second_text)], [first, second])
+        self.assertFalse(full.valid)
+        self.assertEqual(full.errors[0]["case"], "second.txt")
+
+        invalid_limit = validator.validate(code, [Case("first.txt", CASE_TEXT)], [first], max_cases=0)
+        self.assertFalse(invalid_limit.valid)
+        self.assertEqual(invalid_limit.errors[0]["type"], "invalid_validator_config")
 
     def test_validator_accepts_submission_sample_solvers(self):
         with open("examples/demo_case.txt", "r", encoding="utf-8") as handle:
@@ -367,6 +429,11 @@ def solve(input_text: str) -> list:
             with self.assertRaises(CaseParseError) as context:
                 load_cases([path], max_cases=1)
             self.assertEqual([item.code for item in context.exception.diagnostics], ["malformed_row", "empty_task_key"])
+
+    def test_case_parser_only_skips_exact_header_row(self):
+        parsed = parse_case("task_id_list\tc0\t10\t0.8\n", case_name="header_like_data.txt")
+        self.assertEqual(parsed.all_tasks, ["task_id_list"])
+        self.assertEqual(parsed.all_couriers, ["c0"])
 
     def test_memory_json_roundtrip(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -538,6 +605,30 @@ def solve(input_text: str) -> list:
         self.assertEqual(report["strategy_workers"], 2)
         self.assertGreaterEqual(report["summary"]["candidates_generated"], 2)
 
+    def test_final_rank_uses_runtime_tiebreaker(self):
+        fast = ScoreResult(
+            name="fast",
+            rank=(0, -2, 30.0, 0.01),
+            total_covered=2,
+            total_tasks=2,
+            total_penalty=30.0,
+            total_runtime=0.01,
+            failures=0,
+            cases=[],
+        )
+        slow = ScoreResult(
+            name="slow",
+            rank=(0, -2, 30.0, 1.0),
+            total_covered=2,
+            total_tasks=2,
+            total_penalty=30.0,
+            total_runtime=1.0,
+            failures=0,
+            cases=[],
+        )
+
+        self.assertLess(_final_rank(fast), _final_rank(slow))
+
     def test_runner_merges_worker_reports_and_finalizes_global_best(self):
         with tempfile.TemporaryDirectory() as tmp:
             case = Case("case.txt", CASE_TEXT)
@@ -591,6 +682,21 @@ def solve(input_text: str) -> list:
                     )
                 )
 
+            def fake_finalize_score(self, candidate, cases, parsed_cases, best=None, timeout=None):
+                worker_id = 1 if "worker_1" in candidate.name else 0
+                penalty = 30.0 + worker_id
+                runtime = 0.01 + worker_id
+                return ScoreResult(
+                    name=candidate.name,
+                    rank=(0, -2, penalty, runtime),
+                    total_covered=2,
+                    total_tasks=2,
+                    total_penalty=penalty,
+                    total_runtime=runtime,
+                    failures=0,
+                    cases=[],
+                )
+
             config = AutoSolverRunConfig(
                 iterations=5,
                 deadline=time.time() + 10,
@@ -613,6 +719,9 @@ def solve(input_text: str) -> list:
             with patch("autosolver_agent.workflow.runner.LLMCodeGenerator.validate_environment"), patch(
                 "autosolver_agent.workflow.runner._worker_entry",
                 side_effect=fake_worker_entry,
+            ), patch(
+                "autosolver_agent.workflow.runner.Scorer.score",
+                new=fake_finalize_score,
             ):
                 report = AutoSolverRunner([case], [parsed], config).run()
 
@@ -629,6 +738,85 @@ def solve(input_text: str) -> list:
             self.assertTrue(os.path.exists(config.output_path))
             self.assertEqual(report["best"]["name"], "worker_0_solver")
             self.assertEqual(len(report["worker_reports"]), 2)
+
+    def test_runner_detects_worker_exit_without_queue_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            case = Case("case.txt", CASE_TEXT)
+            parsed = parse_case(CASE_TEXT)
+            config = AutoSolverRunConfig(
+                iterations=1,
+                deadline=time.time() + 2,
+                per_case_timeout=2,
+                search_per_case_timeout=1,
+                output_path=os.path.join(tmp, "generated_submit_solution.py"),
+                memory_dir=os.path.join(tmp, "memory"),
+                artifact_dir=os.path.join(tmp, "artifacts"),
+                llm_model=None,
+                llm_base_url=None,
+                verbose=False,
+                finalize_top_k=1,
+                max_repair_attempts=0,
+                memory_top_k=1,
+                bandit_exploration=1.4,
+                strategy_workers=2,
+                summary_output_path=None,
+                event_log_path=None,
+            )
+
+            def silent_worker_entry(worker_id, iteration_counter, iteration_lock, cases, parsed_cases, config, queue):
+                return None
+
+            with patch("autosolver_agent.workflow.runner.LLMCodeGenerator.validate_environment"), patch(
+                "autosolver_agent.workflow.runner._worker_entry",
+                side_effect=silent_worker_entry,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "exited without reporting"):
+                    AutoSolverRunner([case], [parsed], config).run()
+
+    def test_runner_detects_worker_that_reports_but_does_not_exit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            case = Case("case.txt", CASE_TEXT)
+            parsed = parse_case(CASE_TEXT)
+            config = AutoSolverRunConfig(
+                iterations=1,
+                deadline=time.time() + 5,
+                per_case_timeout=2,
+                search_per_case_timeout=1,
+                output_path=os.path.join(tmp, "generated_submit_solution.py"),
+                memory_dir=os.path.join(tmp, "memory"),
+                artifact_dir=os.path.join(tmp, "artifacts"),
+                llm_model=None,
+                llm_base_url=None,
+                verbose=False,
+                finalize_top_k=1,
+                max_repair_attempts=0,
+                memory_top_k=1,
+                bandit_exploration=1.4,
+                strategy_workers=2,
+                summary_output_path=None,
+                event_log_path=None,
+            )
+
+            def hanging_after_report(worker_id, iteration_counter, iteration_lock, cases, parsed_cases, config, queue):
+                queue.put(
+                    (
+                        "ok",
+                        {
+                            "worker_id": worker_id,
+                            "iterations_completed": 0,
+                            "artifacts": [],
+                            "experiments": [],
+                        },
+                    )
+                )
+                time.sleep(10)
+
+            with patch("autosolver_agent.workflow.runner.LLMCodeGenerator.validate_environment"), patch(
+                "autosolver_agent.workflow.runner._worker_entry",
+                side_effect=hanging_after_report,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "did not exit after reporting"):
+                    AutoSolverRunner([case], [parsed], config).run()
 
     def test_runner_strategy_workers_one_runs_current_process_workflow(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -866,6 +1054,7 @@ def solve(input_text: str) -> list:
             report = agent.run()
             self.assertTrue(any(item.get("candidate") == "validation_repair" for item in report["repair_history"]))
             self.assertTrue(any(item.get("reason") == "validation_error" for item in report["repair_history"]))
+            self.assertTrue(any(item.get("candidate") == "bad_duplicate" for item in report["validation_errors"]))
             self.assertTrue(report["experiments"])
 
     def test_validation_repair_continues_after_bad_repair_schema(self):
@@ -898,6 +1087,74 @@ def solve(input_text: str) -> list:
             report = agent.run()
             self.assertTrue(any("error" in item for item in report["repair_history"]))
             self.assertTrue(any(item.get("candidate") == "second_repair" for item in report["repair_history"]))
+
+    def test_agent_sanitizes_framework_reflection_update_during_workflow(self):
+        bad_update = json.dumps(
+            {
+                "update_reason": "Keep useful skill guidance and filter unknown strategy references.",
+                "skills": [
+                    {
+                        "name": "mixed_reflection_skill",
+                        "strategy_names": ["risk_balanced_cover", "unknown_strategy"],
+                        "construction_notes": "Use known strategy guidance and ignore unknown anchors.",
+                        "code_contract": "solve(input_text: str) -> list",
+                        "constraints": ["No duplicate tasks."],
+                    },
+                    {
+                        "name": "orphan_reflection_skill",
+                        "strategy_names": ["unknown_strategy"],
+                        "construction_notes": "This update should be dropped because it has no valid strategy.",
+                        "code_contract": "solve(input_text: str) -> list",
+                        "constraints": ["No duplicate tasks."],
+                    },
+                ],
+            },
+            ensure_ascii=False,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            case_path = os.path.join(tmp, "case.txt")
+            out_path = os.path.join(tmp, "generated_submit_solution.py")
+            with open(case_path, "w", encoding="utf-8") as handle:
+                handle.write(CASE_TEXT)
+            agent = AutoSolverLangChainAgent(
+                case_paths=[case_path],
+                output_path=out_path,
+                budget_seconds=10,
+                per_case_timeout=2,
+                search_per_case_timeout=1,
+                iterations=1,
+                memory_dir=os.path.join(tmp, "memory"),
+                artifact_dir=os.path.join(tmp, "artifacts"),
+                llm=FakeLLM(
+                    plan_outputs=[structured_plan("framework_sanitize_plan")],
+                    candidate_outputs=[structured_candidate("framework_sanitize_solver")],
+                    framework_update_outputs=[bad_update],
+                ),
+                max_cases=1,
+                verbose=False,
+                strategy_workers=1,
+            )
+
+            report = agent.run()
+
+        sanitized_updates = [item for item in report["framework_updates"] if item.get("sanitation")]
+        self.assertTrue(sanitized_updates)
+        self.assertEqual(sanitized_updates[-1]["sanitation"]["dropped_skills"], ["orphan_reflection_skill"])
+        skills = {item["name"]: item for item in report["solver_framework"]["framework"]["skills"]}
+        self.assertEqual(skills["mixed_reflection_skill"]["strategy_names"], ["risk_balanced_cover"])
+        self.assertNotIn("orphan_reflection_skill", skills)
+
+    def test_run_sh_uses_environment_secrets_and_public_defaults(self):
+        with open("run.sh", "r", encoding="utf-8") as handle:
+            script = handle.read()
+
+        self.assertNotIn("sk-", script)
+        self.assertNotIn("nasyh.cyou", script)
+        self.assertNotIn("gpt-5.5", script)
+        self.assertNotRegex(script, r"OPENAI_API_KEY=['\"]sk-")
+        self.assertIn('OPENAI_API_KEY="$OPENAI_KEY"', script)
+        self.assertIn("https://api.openai.com/v1", script)
+        self.assertIn("gpt-4o-mini", script)
 
     def test_agent_without_llm_fails_instead_of_falling_back(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -973,6 +1230,49 @@ def solve(input_text: str) -> list:
         self.assertEqual(args.baseline_solvers, ["solvers/solver.py", "solvers/seed_solvers.py"])
         self.assertEqual(args.summary_out, "runs/summary.json")
         self.assertEqual(args.event_log, "runs/events.jsonl")
+
+    def test_cli_rejects_invalid_numeric_options(self):
+        invalid_args = [
+            ["--cases", "examples/demo_case.txt", "--budget", "0"],
+            ["--cases", "examples/demo_case.txt", "--per-case-timeout", "0"],
+            ["--cases", "examples/demo_case.txt", "--search-per-case-timeout", "0"],
+            ["--cases", "examples/demo_case.txt", "--iterations", "0"],
+            ["--cases", "examples/demo_case.txt", "--max-cases", "0"],
+            ["--cases", "examples/demo_case.txt", "--finalize-top-k", "0"],
+            ["--cases", "examples/demo_case.txt", "--memory-top-k", "0"],
+            ["--cases", "examples/demo_case.txt", "--bandit-exploration", "-0.1"],
+            ["--cases", "examples/demo_case.txt", "--strategy-workers", "0"],
+            ["--cases", "examples/demo_case.txt", "--max-repair-attempts", "-1"],
+        ]
+        for argv in invalid_args:
+            with self.subTest(argv=argv), patch("sys.stderr", new_callable=io.StringIO):
+                with self.assertRaises(SystemExit):
+                    build_parser().parse_args(argv)
+
+    def test_agent_rejects_invalid_numeric_config_before_loading_cases(self):
+        invalid_configs = [
+            ("budget_seconds", {"budget_seconds": 0}),
+            ("per_case_timeout", {"per_case_timeout": 0}),
+            ("search_per_case_timeout", {"search_per_case_timeout": 0}),
+            ("iterations", {"iterations": 0}),
+            ("max_cases", {"max_cases": 0}),
+            ("finalize_top_k", {"finalize_top_k": 0}),
+            ("max_repair_attempts", {"max_repair_attempts": -1}),
+            ("memory_top_k", {"memory_top_k": 0}),
+            ("bandit_exploration", {"bandit_exploration": -0.1}),
+            ("strategy_workers", {"strategy_workers": 0}),
+        ]
+        for name, overrides in invalid_configs:
+            kwargs = {
+                "case_paths": ["missing_case.txt"],
+                "llm": FakeLLM(),
+                "strategy_workers": 1,
+            }
+            kwargs.update(overrides)
+            with self.subTest(name=name):
+                agent = AutoSolverLangChainAgent(**kwargs)
+                with self.assertRaisesRegex(RuntimeError, name):
+                    agent.run()
 
 
 if __name__ == "__main__":

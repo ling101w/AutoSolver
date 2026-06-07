@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import ast
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from autosolver_agent.caseio import score_answer
 from autosolver_agent.models import Case, ParsedCase, ValidationResult
@@ -143,12 +143,21 @@ class Validator:
         code: str,
         cases: List[Case],
         parsed_cases: List[ParsedCase],
-        max_cases: int = 1,
+        max_cases: Optional[int] = None,
     ) -> ValidationResult:
         errors: List[Dict[str, Any]] = []
         total_runtime = 0.0
         last_answer: Any = None
-        for case, parsed in list(zip(cases, parsed_cases))[:max_cases]:
+        case_pairs = list(zip(cases, parsed_cases))
+        if max_cases is not None:
+            if max_cases < 1:
+                return ValidationResult(
+                    valid=False,
+                    stage="runtime",
+                    errors=[{"type": "invalid_validator_config", "message": "max_cases must be at least 1"}],
+                )
+            case_pairs = case_pairs[: max(0, max_cases)]
+        for case, parsed in case_pairs:
             run = run_candidate(code, case.text, self.smoke_timeout)
             total_runtime += run.get("runtime", 0.0)
             if run["status"] != "ok":
@@ -180,11 +189,17 @@ class Validator:
             answer=last_answer,
         )
 
-    def validate(self, code: str, cases: List[Case], parsed_cases: List[ParsedCase]) -> ValidationResult:
+    def validate(
+        self,
+        code: str,
+        cases: List[Case],
+        parsed_cases: List[ParsedCase],
+        max_cases: Optional[int] = None,
+    ) -> ValidationResult:
         static = self.validate_static(code)
         if not static.valid:
             return static
-        return self.validate_runtime(code, cases, parsed_cases)
+        return self.validate_runtime(code, cases, parsed_cases, max_cases=max_cases)
 
     def _call_name(self, node: ast.AST) -> str:
         if isinstance(node, ast.Name):

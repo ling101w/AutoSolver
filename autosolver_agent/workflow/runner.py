@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import multiprocessing
 import os
+import queue as queue_module
 import time
 import traceback
 from dataclasses import dataclass, field
@@ -118,15 +119,58 @@ class AutoSolverRunner:
 
         worker_reports: List[Dict[str, Any]] = []
         errors: List[Dict[str, Any]] = []
-        for _ in processes:
-            kind, payload = queue.get()
-            if kind == "ok":
-                worker_reports.append(payload)
-            else:
-                errors.append(payload)
+        pending = {worker_id: process for worker_id, process in enumerate(processes)}
+        dead_since: Dict[int, float] = {}
+        while pending:
+            remaining = self.config.deadline - time.time()
+            if remaining <= 0:
+                for worker_id, process in list(pending.items()):
+                    _terminate_process(process)
+                    errors.append(
+                        {
+                            "worker_id": worker_id,
+                            "error": "worker exceeded run deadline without reporting",
+                            "exitcode": process.exitcode,
+                        }
+                    )
+                    pending.pop(worker_id, None)
+                break
 
-        for process in processes:
-            process.join()
+            try:
+                kind, payload = queue.get(timeout=min(0.25, max(0.01, remaining)))
+                _record_worker_result(kind, payload, worker_reports, errors, pending)
+                dead_since.pop(int(payload.get("worker_id", -1)) if isinstance(payload, dict) else -1, None)
+            except queue_module.Empty:
+                pass
+
+            _drain_worker_queue(queue, worker_reports, errors, pending, dead_since)
+            now = time.time()
+            for worker_id, process in list(pending.items()):
+                if process.is_alive() or process.exitcode is None:
+                    continue
+                first_seen = dead_since.setdefault(worker_id, now)
+                if now - first_seen < 0.25:
+                    continue
+                errors.append(
+                    {
+                        "worker_id": worker_id,
+                        "error": f"worker exited without reporting (exitcode={process.exitcode})",
+                        "exitcode": process.exitcode,
+                    }
+                )
+                pending.pop(worker_id, None)
+
+        for worker_id, process in enumerate(processes):
+            process.join(0.5)
+            if process.is_alive():
+                _terminate_process(process)
+                errors.append(
+                    {
+                        "worker_id": worker_id,
+                        "error": "worker did not exit after reporting",
+                        "exitcode": process.exitcode,
+                    }
+                )
 
         if errors:
             first = errors[0]
@@ -203,6 +247,52 @@ class AutoSolverRunner:
         if self.config.summary_output_path:
             write_json(self.config.summary_output_path, report["summary"])
         return report
+
+
+def _record_worker_result(
+    kind: Any,
+    payload: Any,
+    worker_reports: List[Dict[str, Any]],
+    errors: List[Dict[str, Any]],
+    pending: Dict[int, multiprocessing.Process],
+) -> None:
+    if not isinstance(payload, dict):
+        errors.append({"worker_id": None, "error": f"worker returned non-dict payload: {payload!r}"})
+        return
+    worker_id = payload.get("worker_id")
+    if isinstance(worker_id, int):
+        pending.pop(worker_id, None)
+    if kind == "ok":
+        worker_reports.append(payload)
+    else:
+        errors.append(payload)
+
+
+def _drain_worker_queue(
+    result_queue: multiprocessing.Queue,
+    worker_reports: List[Dict[str, Any]],
+    errors: List[Dict[str, Any]],
+    pending: Dict[int, multiprocessing.Process],
+    dead_since: Dict[int, float],
+) -> None:
+    while True:
+        try:
+            kind, payload = result_queue.get_nowait()
+        except queue_module.Empty:
+            return
+        _record_worker_result(kind, payload, worker_reports, errors, pending)
+        if isinstance(payload, dict) and isinstance(payload.get("worker_id"), int):
+            dead_since.pop(payload["worker_id"], None)
+
+
+def _terminate_process(process: multiprocessing.Process) -> None:
+    if not process.is_alive():
+        return
+    process.terminate()
+    process.join(0.5)
+    if process.is_alive() and hasattr(process, "kill"):
+        process.kill()
+        process.join(0.5)
 
 
 def _worker_entry(

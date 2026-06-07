@@ -6,7 +6,7 @@ import json
 import os
 import re
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -238,6 +238,40 @@ class FrameworkStore:
             self.document = latest
             return {"action": "update_applied", "iteration": iteration, "framework_counts": self.counts(), "reason": update.update_reason}
 
+    def sanitize_update(self, update: FrameworkUpdate) -> Tuple[FrameworkUpdate, Dict[str, Any]]:
+        """Drop or trim framework update fragments that cannot reference active strategies."""
+
+        current = self.framework
+        retired = set(update.retire_strategy_names)
+        available_strategies = {
+            item.name for item in current.strategies if item.status != "retired" and item.name not in retired
+        }
+        available_strategies.update(item.name for item in update.strategies if item.status != "retired")
+
+        filtered_skills = []
+        dropped_skills = []
+        filtered_strategy_names: Dict[str, Dict[str, List[str]]] = {}
+        for skill in update.skills:
+            if skill.status == "retired":
+                filtered_skills.append(skill)
+                continue
+            allowed = [name for name in skill.strategy_names if name in available_strategies]
+            removed = [name for name in skill.strategy_names if name not in available_strategies]
+            if removed:
+                filtered_strategy_names[skill.name] = {"kept": allowed, "removed": removed}
+            if skill.strategy_names and not allowed:
+                dropped_skills.append(skill.name)
+                continue
+            filtered_skills.append(skill.model_copy(update={"strategy_names": allowed}))
+
+        changed = bool(dropped_skills or filtered_strategy_names)
+        sanitized = update.model_copy(update={"skills": filtered_skills}) if changed else update
+        return sanitized, {
+            "changed": changed,
+            "dropped_skills": dropped_skills,
+            "filtered_strategy_names": filtered_strategy_names,
+        }
+
     def snapshot(self) -> Dict[str, Any]:
         return {
             "path": self.path,
@@ -452,6 +486,10 @@ class _FileLock:
     def __enter__(self) -> "_FileLock":
         os.makedirs(os.path.dirname(os.path.abspath(self.path)), exist_ok=True)
         self._handle = open(self.path, "a+", encoding="utf-8")
+        self._handle.seek(0)
+        if not self._handle.read(1):
+            self._handle.write("0")
+            self._handle.flush()
         self._lock()
         return self
 
@@ -466,6 +504,7 @@ class _FileLock:
     def _lock(self) -> None:
         if self._handle is None:
             return
+        self._handle.seek(0)
         if os.name == "nt":
             import msvcrt
 
@@ -478,6 +517,7 @@ class _FileLock:
     def _unlock(self) -> None:
         if self._handle is None:
             return
+        self._handle.seek(0)
         if os.name == "nt":
             import msvcrt
 
