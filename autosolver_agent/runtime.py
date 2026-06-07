@@ -21,8 +21,11 @@ SAFE_IMPORT_ROOTS = {
     "heapq",
     "itertools",
     "math",
+    "networkx",
+    "numpy",
     "operator",
     "random",
+    "scipy",
     "statistics",
     "time",
     "typing",
@@ -135,7 +138,7 @@ SAFE_BUILTIN_NAMES = {
 @dataclass(frozen=True)
 class ExecutionPolicy:
     allowed_import_roots: Set[str] = field(default_factory=lambda: set(SAFE_IMPORT_ROOTS))
-    max_memory_mb: int = 256
+    max_memory_mb: int = 1024
     cpu_grace_seconds: int = 0
     kill_grace_seconds: float = 0.2
 
@@ -219,8 +222,9 @@ def _apply_resource_limits(policy: ExecutionPolicy) -> None:
         resource.setrlimit(resource.RLIMIT_CPU, (cpu_limit, cpu_limit + 1))
         memory_bytes = max(16, int(policy.max_memory_mb)) * 1024 * 1024
         resource.setrlimit(resource.RLIMIT_AS, (memory_bytes, memory_bytes))
-        if hasattr(resource, "RLIMIT_FSIZE"):
-            resource.setrlimit(resource.RLIMIT_FSIZE, (0, 0))
+        # Do not set RLIMIT_FSIZE here: multiprocessing.Queue may use pipe/file
+        # descriptors that need to write the candidate result back to the parent.
+        # Candidate file IO is already blocked by static validation and safe builtins.
     except Exception:
         return
     try:

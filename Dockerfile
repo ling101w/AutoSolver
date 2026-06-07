@@ -1,6 +1,6 @@
 FROM python:3.10-slim AS runtime
 
-ARG VERSION=1.0.0
+ARG VERSION=1.5.0
 ARG VCS_REF=unknown
 
 LABEL org.opencontainers.image.title="AutoSolver Agent" \
@@ -16,7 +16,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-COPY pyproject.toml requirements.txt README_langchain_agent.md langchain_autosolver_agent.py ./
+COPY pyproject.toml requirements.txt README.md ./
 COPY autosolver_agent ./autosolver_agent
 COPY solvers ./solvers
 COPY examples ./examples

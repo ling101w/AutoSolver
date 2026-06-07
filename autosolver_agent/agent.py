@@ -8,10 +8,8 @@ import time
 from typing import Any, Dict, List, Optional
 
 from autosolver_agent.artifacts import write_json
-from autosolver_agent.caseio import diagnostics_to_dicts, discover_case_paths, load_cases_with_diagnostics, parse_case
-from autosolver_agent.llm import LLMCodeGenerator
-from autosolver_agent.memory import MemoryStore
-from autosolver_agent.workflow import AutoSolverWorkflow
+from autosolver_agent.caseio import discover_case_paths, load_cases, parse_case
+from autosolver_agent.workflow import AutoSolverRunConfig, AutoSolverRunner
 
 
 class AutoSolverLangChainAgent:
@@ -34,15 +32,16 @@ class AutoSolverLangChainAgent:
         max_repair_attempts: int = 2,
         memory_top_k: int = 5,
         bandit_exploration: float = 1.4,
+        baseline_solver_paths: Optional[List[str]] = None,
+        strategy_workers: int = 5,
         summary_output_path: Optional[str] = None,
-        strict_cases: bool = False,
         event_log_path: Optional[str] = None,
     ) -> None:
         self.case_paths = case_paths or []
         self.output_path = output_path
         self.budget_seconds = budget_seconds
         self.per_case_timeout = per_case_timeout
-        self.search_per_case_timeout = search_per_case_timeout or per_case_timeout
+        self.search_per_case_timeout = per_case_timeout if search_per_case_timeout is None else search_per_case_timeout
         self.iterations = iterations
         self.memory_dir = memory_dir
         self.artifact_dir = artifact_dir
@@ -55,45 +54,72 @@ class AutoSolverLangChainAgent:
         self.max_repair_attempts = max_repair_attempts
         self.memory_top_k = memory_top_k
         self.bandit_exploration = bandit_exploration
+        self.baseline_solver_paths = [os.path.abspath(path) for path in list(baseline_solver_paths or [])]
+        self.strategy_workers = int(strategy_workers)
         self.summary_output_path = summary_output_path
-        self.strict_cases = strict_cases
         self.event_log_path = event_log_path
 
     def run(self) -> Dict[str, Any]:
+        self._validate_config()
         paths = self.case_paths or discover_case_paths(os.getcwd())
-        cases, diagnostics = load_cases_with_diagnostics(paths, self.max_cases, strict=self.strict_cases)
+        cases = load_cases(paths, self.max_cases)
         if not cases:
             raise RuntimeError("No valid case files found.")
-        parsed_cases = [parse_case(case.text) for case in cases]
-        memory = MemoryStore(self.memory_dir)
-        from autosolver_agent.artifacts import ArtifactStore
+        parsed_cases = [parse_case(case.text, case_name=case.name, path=case.path) for case in cases]
 
-        artifacts = ArtifactStore(self.artifact_dir)
-        llm = LLMCodeGenerator(model=self.llm_model, base_url=self.llm_base_url, llm=self.llm)
-        workflow = AutoSolverWorkflow(
+        deadline = time.time() + self.budget_seconds
+        runner = AutoSolverRunner(
             cases=cases,
             parsed_cases=parsed_cases,
-            iterations=self.iterations,
-            deadline=time.time() + self.budget_seconds,
-            per_case_timeout=self.per_case_timeout,
-            search_per_case_timeout=self.search_per_case_timeout,
-            output_path=self.output_path,
-            memory=memory,
-            artifacts=artifacts,
-            llm=llm,
-            verbose=self.verbose,
-            finalize_top_k=self.finalize_top_k,
-            max_repair_attempts=self.max_repair_attempts,
-            memory_top_k=self.memory_top_k,
-            bandit_exploration=self.bandit_exploration,
-            summary_output_path=self.summary_output_path,
-            case_diagnostics=diagnostics_to_dicts(diagnostics),
-            event_log_path=self.event_log_path,
+            config=AutoSolverRunConfig(
+                iterations=self.iterations,
+                deadline=deadline,
+                per_case_timeout=self.per_case_timeout,
+                search_per_case_timeout=self.search_per_case_timeout,
+                output_path=self.output_path,
+                memory_dir=self.memory_dir,
+                artifact_dir=self.artifact_dir,
+                llm_model=self.llm_model,
+                llm_base_url=self.llm_base_url,
+                verbose=self.verbose,
+                finalize_top_k=self.finalize_top_k,
+                max_repair_attempts=self.max_repair_attempts,
+                memory_top_k=self.memory_top_k,
+                bandit_exploration=self.bandit_exploration,
+                baseline_solver_paths=self.baseline_solver_paths,
+                strategy_workers=self.strategy_workers,
+                summary_output_path=self.summary_output_path,
+                event_log_path=self.event_log_path,
+                llm=self.llm,
+            ),
         )
-        report = workflow.run()
+        report = runner.run()
         report_path = self.output_path + ".report.json"
         write_json(report_path, report)
         return report
 
     def run_json(self) -> str:
         return json.dumps(self.run(), indent=2, ensure_ascii=False, sort_keys=True)
+
+    def _validate_config(self) -> None:
+        checks = [
+            ("budget_seconds", self.budget_seconds, 0, False),
+            ("per_case_timeout", self.per_case_timeout, 0, False),
+            ("search_per_case_timeout", self.search_per_case_timeout, 0, False),
+            ("iterations", self.iterations, 1, True),
+            ("max_cases", self.max_cases, 1, True),
+            ("finalize_top_k", self.finalize_top_k, 1, True),
+            ("max_repair_attempts", self.max_repair_attempts, 0, True),
+            ("memory_top_k", self.memory_top_k, 1, True),
+            ("bandit_exploration", self.bandit_exploration, 0, True),
+            ("strategy_workers", self.strategy_workers, 1, True),
+        ]
+        for name, value, minimum, inclusive in checks:
+            if inclusive:
+                valid = value >= minimum
+                op = ">="
+            else:
+                valid = value > minimum
+                op = ">"
+            if not valid:
+                raise RuntimeError(f"AutoSolver Agent requires {name} {op} {minimum}.")

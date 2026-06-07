@@ -1,4 +1,4 @@
-"""LangChain-compatible planner tools for the AutoSolver Agent."""
+"""LangChain planner tools for the AutoSolver Agent."""
 
 from __future__ import annotations
 
@@ -12,29 +12,31 @@ class PlannerToolbox:
     def __init__(
         self,
         instance_features: Dict[str, Any],
-        strategy_context: str,
+        solver_framework: Dict[str, Any],
         memory: Any,
         artifacts: Any,
         feature_query: Dict[str, Any],
         memory_top_k: int,
         bandit_exploration: float,
         best_summary: Dict[str, Any],
+        candidate_arms: Optional[List[str]] = None,
     ) -> None:
         self.instance_features = instance_features
-        self.strategy_context = strategy_context
+        self.solver_framework = solver_framework
         self.memory = memory
         self.artifacts = artifacts
         self.feature_query = feature_query
         self.memory_top_k = memory_top_k
         self.bandit_exploration = bandit_exploration
         self.best_summary = best_summary
+        self.candidate_arms = list(candidate_arms or [])
         self.trace: List[Dict[str, Any]] = []
 
     def get_instance_features(self) -> str:
         return self._record("get_instance_features", {}, self.instance_features)
 
-    def get_strategy_library(self) -> str:
-        return self._record("get_strategy_library", {}, {"strategy_context": self.strategy_context})
+    def get_solver_framework(self) -> str:
+        return self._record("get_solver_framework", {}, self.solver_framework)
 
     def retrieve_similar_experiments(self, top_k: Optional[int] = None) -> str:
         limit = int(top_k or self.memory_top_k)
@@ -42,7 +44,7 @@ class PlannerToolbox:
         return self._record("retrieve_similar_experiments", {"top_k": limit}, result)
 
     def get_bandit_recommendations(self, limit: int = 5) -> str:
-        candidates = self.feature_query.get("recommended_focus", []) or self.feature_query.get("tags", [])
+        candidates = self.candidate_arms or self.feature_query.get("recommended_focus", []) or self.feature_query.get("tags", [])
         result = self.memory.bandit_recommendations(
             candidate_arms=candidates,
             exploration=self.bandit_exploration,
@@ -56,10 +58,10 @@ class PlannerToolbox:
     def snapshot(self) -> Dict[str, Any]:
         return {
             "instance_features": self.instance_features,
-            "strategy_context": self.strategy_context,
+            "solver_framework": self.solver_framework,
             "similar_experiments": self.memory.retrieve_similar(self.feature_query, top_k=self.memory_top_k),
             "bandit_recommendations": self.memory.bandit_recommendations(
-                candidate_arms=self.feature_query.get("recommended_focus", []) or self.feature_query.get("tags", []),
+                candidate_arms=self.candidate_arms or self.feature_query.get("recommended_focus", []) or self.feature_query.get("tags", []),
                 exploration=self.bandit_exploration,
                 limit=5,
             ),
@@ -73,12 +75,9 @@ class PlannerToolbox:
 
 
 def build_langchain_tools(toolbox: PlannerToolbox) -> List[Any]:
-    """Build StructuredTool objects when LangChain Core is installed."""
+    """Build StructuredTool objects for planner tool calls."""
 
-    try:
-        from langchain_core.tools import StructuredTool
-    except Exception:
-        return []
+    from langchain_core.tools import StructuredTool
 
     def make_tool(name: str, description: str, func: Callable[..., str]) -> Any:
         return StructuredTool.from_function(func=func, name=name, description=description)
@@ -90,9 +89,9 @@ def build_langchain_tools(toolbox: PlannerToolbox) -> List[Any]:
             lambda: toolbox.get_instance_features(),
         ),
         make_tool(
-            "get_strategy_library",
-            "Return the selected and available AutoSolver strategy guidance.",
-            lambda: toolbox.get_strategy_library(),
+            "get_solver_framework",
+            "Return the LLM-maintained feature, strategy, and skill framework.",
+            lambda: toolbox.get_solver_framework(),
         ),
         make_tool(
             "retrieve_similar_experiments",

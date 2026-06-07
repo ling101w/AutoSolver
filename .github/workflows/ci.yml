@@ -25,7 +25,7 @@ jobs:
       - name: Docker build smoke test
         run: |
           docker build \
-            --build-arg VERSION=1.0.0 \
+            --build-arg VERSION=1.5.0 \
             --build-arg VCS_REF=${GITHUB_SHA::7} \
             -t autosolver-agent:ci .
           docker run --rm autosolver-agent:ci --version

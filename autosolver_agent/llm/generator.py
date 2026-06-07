@@ -4,9 +4,19 @@ from __future__ import annotations
 
 import json
 import os
-import re
 from typing import Any, Dict, List, Optional
 
+from autosolver_agent.framework import (
+    FrameworkUpdate,
+    InstanceInterpretation,
+    SolverFramework,
+    framework_update_schema_text,
+    instance_interpretation_schema_text,
+    parse_framework_update,
+    parse_instance_interpretation,
+    parse_solver_framework,
+    solver_framework_schema_text,
+)
 from autosolver_agent.llm.schema import (
     SolverPlan,
     candidate_schema_text,
@@ -16,7 +26,18 @@ from autosolver_agent.llm.schema import (
     plan_schema_text,
 )
 from autosolver_agent.models import Candidate
+from autosolver_agent.runtime import SAFE_IMPORT_ROOTS
 from autosolver_agent.tools.langchain_tools import PlannerToolbox, build_langchain_tools
+
+SOLVER_OUTPUT_CONTRACT = (
+    "solve(input_text: str) must return one flat solution, not a portfolio of alternatives. "
+    "The return value is list[tuple[str, list[str]]]. Each item is "
+    "(task_id_list, courier_ids), where task_id_list is exactly one input task_id_list group string "
+    "such as 't0' or 't1,t2', and courier_ids is a non-empty list of courier_id strings valid for that group. "
+    "Do not return (task_id_list, courier_id) pairs with a bare string courier. "
+    "Do not return dictionaries, row objects, nested lists of multiple solutions, scores, or metadata."
+)
+ALLOWED_IMPORT_ROOTS_TEXT = ", ".join(name for name in sorted(SAFE_IMPORT_ROOTS) if name != "__future__")
 
 
 class LLMCodeGenerator:
@@ -41,14 +62,19 @@ class LLMCodeGenerator:
         self.last_planner_trace: List[Dict[str, Any]] = []
         self.last_tool_calls: List[Dict[str, Any]] = []
 
-    def _build_langchain_llm(self) -> Any:
-        api_key = os.environ.get("OPENAI_API_KEY") or os.environ.get("OPENAI_KEY")
-        if not api_key:
+    @staticmethod
+    def validate_environment() -> None:
+        if not (os.environ.get("OPENAI_API_KEY") or os.environ.get("OPENAI_KEY")):
             raise RuntimeError("LLM code generation requires OPENAI_API_KEY or OPENAI_KEY.")
         try:
-            from langchain_openai import ChatOpenAI
+            from langchain_openai import ChatOpenAI  # noqa: F401
         except Exception as exc:
             raise RuntimeError("LLM code generation requires langchain-openai. Install requirements.txt.") from exc
+
+    def _build_langchain_llm(self) -> Any:
+        self.validate_environment()
+        from langchain_openai import ChatOpenAI
+
         kwargs: Dict[str, Any] = {"model": self.model, "temperature": self.temperature}
         if self.base_url:
             kwargs["base_url"] = self.base_url
@@ -64,83 +90,164 @@ class LLMCodeGenerator:
         self,
         iteration: int,
         instance_features: Dict[str, Any],
-        strategy_context: str,
+        solver_framework_context: str,
         memory_digest: Dict[str, Any],
         previous_impact: List[Dict[str, Any]],
         toolbox: Optional[PlannerToolbox] = None,
     ) -> SolverPlan:
         """Produce a SolverPlan, using LangChain tools when the LLM supports them."""
 
-        fallback_context = toolbox.snapshot() if toolbox is not None else {}
         if not hasattr(self.llm, "bind_tools") or toolbox is None:
-            plan = self._fallback_plan(iteration, instance_features, memory_digest)
-            self.last_planner_trace = [{"mode": "fallback", "plan": model_dump(plan), "tool_context": fallback_context}]
-            self.last_tool_calls = []
-            return plan
+            raise RuntimeError("Planning requires an LLM with bind_tools support and a PlannerToolbox.")
 
         tools = build_langchain_tools(toolbox)
         if not tools:
-            plan = self._fallback_plan(iteration, instance_features, memory_digest)
-            self.last_planner_trace = [{"mode": "fallback_no_tools", "plan": model_dump(plan), "tool_context": fallback_context}]
-            self.last_tool_calls = []
-            return plan
+            raise RuntimeError("Planning requires LangChain planner tools; build_langchain_tools returned no tools.")
 
         system = (
-            "You are the planning controller for AutoSolver Agent. Use tools to inspect instance features, "
-            "strategy guidance, memory, bandit recommendations, and the current best artifact. "
+            "You are the planning controller for AutoSolver Agent. Use tools to inspect objective instance features, "
+            "the LLM-maintained solver framework, memory, bandit recommendations, and the current best artifact. "
+            "You may create strategy names that are not yet in the framework if the instance evidence supports them. "
             "Return only JSON matching this SolverPlan schema:\n"
             + plan_schema_text()
         )
         user = (
             f"Plan solver generation for iteration {iteration}. "
-            "Prefer strategies that fit current features and historical results. "
-            "Use a balanced explore/exploit policy. Previous impact:\n"
+            "Prefer strategies that fit current interpreted features and historical results. "
+            "Use a balanced explore/exploit policy and preserve the solver safety contract. "
+            "Current solver framework context:\n"
+            + solver_framework_context
+            + "\n\nPrevious impact:\n"
             + _json(previous_impact[-5:])
         )
         messages: List[Any] = [("system", system), ("human", user)]
         trace: List[Dict[str, Any]] = []
         content = ""
-        try:
-            tool_llm = self.llm.bind_tools(tools)
-            tool_by_name = {getattr(tool, "name", ""): tool for tool in tools}
-            for _ in range(4):
-                response = tool_llm.invoke(messages)
-                tool_calls = list(getattr(response, "tool_calls", []) or [])
-                if not tool_calls:
-                    content = self._content(response)
-                    break
-                messages.append(response)
-                for call in tool_calls:
-                    name = call.get("name")
-                    args = call.get("args") or {}
-                    tool = tool_by_name.get(name)
-                    result = tool.invoke(args) if tool is not None else f"unknown tool: {name}"
-                    trace.append({"tool": name, "args": args, "result": result})
-                    messages.append(_tool_message(str(result), call.get("id"), name))
-            if not content:
-                response = self.llm.invoke(
-                    [
-                        ("system", system),
-                        ("human", "Tool context:\n" + _json(fallback_context) + "\nReturn SolverPlan JSON only."),
-                    ]
-                )
+        tool_llm = self.llm.bind_tools(tools)
+        tool_by_name = {getattr(tool, "name", ""): tool for tool in tools}
+        for _ in range(4):
+            response = tool_llm.invoke(messages)
+            tool_calls = list(getattr(response, "tool_calls", []) or [])
+            if not tool_calls:
                 content = self._content(response)
-            plan = parse_solver_plan(content)
-            self.last_planner_trace = [{"mode": "tool_calling", "raw_response": content, "plan": model_dump(plan)}]
-            self.last_tool_calls = trace or toolbox.trace
-            return plan
-        except Exception as exc:
-            plan = self._fallback_plan(iteration, instance_features, memory_digest)
-            self.last_planner_trace = [
-                {
-                    "mode": "fallback_after_error",
-                    "error": str(exc),
-                    "plan": model_dump(plan),
-                    "tool_context": fallback_context,
-                }
-            ]
-            self.last_tool_calls = trace or toolbox.trace
-            return plan
+                break
+            messages.append(response)
+            for call in tool_calls:
+                name = call.get("name")
+                args = call.get("args") or {}
+                tool = tool_by_name.get(name)
+                if tool is None:
+                    raise RuntimeError(f"Planning LLM requested unknown tool: {name}")
+                result = tool.invoke(args)
+                trace.append({"tool": name, "args": args, "result": result})
+                messages.append(_tool_message(str(result), call.get("id"), name))
+        if not content:
+            raise RuntimeError("Planning LLM exhausted tool-call budget without returning SolverPlan JSON.")
+        plan = parse_solver_plan(content)
+        self.last_planner_trace = [{"mode": "tool_calling", "raw_response": content, "plan": model_dump(plan)}]
+        self.last_tool_calls = trace or toolbox.trace
+        return plan
+
+    def bootstrap_framework(
+        self,
+        objective_features: Dict[str, Any],
+        memory_digest: Dict[str, Any],
+        case_samples: List[str],
+    ) -> SolverFramework:
+        system = (
+            "You maintain AutoSolver Agent's feature, strategy, and implementation-skill framework. "
+            "There is no hardcoded seed catalog. Create an initial solver framework from the objective case statistics, "
+            "historical memory, and the fixed solver safety contract. Keep generated solve() implementations bounded and "
+            "compatible with the runtime sandbox. Return only JSON matching this SolverFramework schema:\n"
+            + solver_framework_schema_text()
+        )
+        user = (
+            "Objective case features:\n{features}\n\n"
+            "Memory digest:\n{memory}\n\n"
+            "Input case samples:\n{samples}\n\n"
+            "Create feature_dimensions, strategies, and skills that are useful for generating safe, self-contained "
+            "solve(input_text: str) implementations that obey this output contract:\n{contract}\n\n"
+            "Candidate code may only import from these validator-approved roots: {allowed_imports}. "
+            "Optional non-standard-library imports must be guarded with deterministic fallbacks.\n\n"
+            "Do not propose changes to validator, scorer, runtime, parser, or the output contract."
+        ).format(
+            features=_json(objective_features),
+            memory=_json(memory_digest),
+            samples="\n\n---\n\n".join(case_samples),
+            contract=SOLVER_OUTPUT_CONTRACT,
+            allowed_imports=ALLOWED_IMPORT_ROOTS_TEXT,
+        )
+        return parse_solver_framework(self._invoke(system, user))
+
+    def interpret_instances(
+        self,
+        iteration: int,
+        objective_features: Dict[str, Any],
+        solver_framework_context: str,
+        memory_digest: Dict[str, Any],
+        case_samples: List[str],
+    ) -> InstanceInterpretation:
+        system = (
+            "You interpret delivery-assignment instances using the LLM-maintained solver framework. "
+            "Do not rely on hardcoded thresholds; derive tags, opportunities, risks, and recommended strategy focus "
+            "from the supplied objective statistics and framework. Return only JSON matching this InstanceInterpretation schema:\n"
+            + instance_interpretation_schema_text()
+        )
+        user = (
+            "Iteration: {iteration}\n\n"
+            "Objective case features:\n{features}\n\n"
+            "Solver framework context:\n{framework}\n\n"
+            "Memory digest:\n{memory}\n\n"
+            "Input case samples:\n{samples}"
+        ).format(
+            iteration=iteration,
+            features=_json(objective_features),
+            framework=solver_framework_context,
+            memory=_json(memory_digest),
+            samples="\n\n---\n\n".join(case_samples),
+        )
+        return parse_instance_interpretation(self._invoke(system, user))
+
+    def reflect_framework(
+        self,
+        iteration: int,
+        solver_framework_context: str,
+        instance_features: Dict[str, Any],
+        plans: List[Dict[str, Any]],
+        evaluations: List[Dict[str, Any]],
+        experiments: List[Dict[str, Any]],
+        previous_impact: List[Dict[str, Any]],
+    ) -> FrameworkUpdate:
+        system = (
+            "You maintain AutoSolver Agent's persistent feature/strategy/skill framework after candidate evaluation. "
+            "Return a partial update: add or replace only useful framework entries, or retire entries that the evidence "
+            "shows are misleading. Keep framework skills compatible with the runtime sandbox. "
+            "The validator, scorer, runtime sandbox, parser, and solve() contract are immutable. "
+            "Return only JSON matching this FrameworkUpdate schema:\n"
+            + framework_update_schema_text()
+        )
+        user = (
+            "Iteration: {iteration}\n\n"
+            "Current solver framework context:\n{framework}\n\n"
+            "Interpreted instance features:\n{features}\n\n"
+            "Plans:\n{plans}\n\n"
+            "Candidate evaluations:\n{evaluations}\n\n"
+            "Recent experiments:\n{experiments}\n\n"
+            "Previous impact:\n{impact}\n\n"
+            "Use both successes and failures as evidence. Keep updates concise and safe. Prefer input-size-bounded logic; "
+            "time-aware guards may be used only within the external runtime limits. Preserve this immutable output contract:\n"
+            "{contract}"
+        ).format(
+            iteration=iteration,
+            framework=solver_framework_context,
+            features=_json(instance_features),
+            plans=_json(plans),
+            evaluations=_json(evaluations),
+            experiments=_json(experiments[-8:]),
+            impact=_json(previous_impact[-8:]),
+            contract=SOLVER_OUTPUT_CONTRACT,
+        )
+        return parse_framework_update(self._invoke(system, user))
 
     def generate_from_plan(
         self,
@@ -157,23 +264,32 @@ class LLMCodeGenerator:
     ) -> Candidate:
         system = (
             "You are AutoSolver Agent's code generator. Generate one complete Python solver. "
-            "The solver must use only Python standard library and define solve(input_text: str) -> list. "
+            "The solver must define solve(input_text: str) -> list, "
+            "and obey this output contract:\n"
+            + SOLVER_OUTPUT_CONTRACT
+            + "\n"
+            f"Candidate code may only import from these validator-approved roots: {ALLOWED_IMPORT_ROOTS_TEXT}. "
+            "Optional non-standard-library imports must be guarded with deterministic fallbacks. "
             "Do not use file IO, network IO, subprocess, eval, exec, compile, or dynamic imports. "
-            "When solver_examples are provided, use them as reference architectures and adapt their patterns "
-            "to the current SolverPlan instead of copying every routine. "
+            "The standard-library time module is allowed for lightweight runtime guards, but candidate code must still "
+            "remain bounded by the external runtime limits. "
+            "Use the LLM-maintained solver framework as guidance, but feel free to create a new strategy variation "
+            "when the current SolverPlan calls for it. "
             "Return exactly one JSON object matching this CandidateEnvelope schema:\n"
             + candidate_schema_text()
         )
         user = (
             "SolverPlan:\n{plan}\n\n"
             "Instance features:\n{features}\n\n"
-            "Solver skill context:\n{solvers}\n\n"
+            "LLM-maintained solver framework:\n{solvers}\n\n"
             "Memory digest:\n{memory}\n\n"
             "Tool context:\n{tool_context}\n\n"
             "Disk historical results:\n{disk}\n\n"
             "Previous impact analysis:\n{impact}\n\n"
             "Input case samples:\n{samples}\n\n"
-            "Constraint: per-case judge timeout is {timeout:.2f}s; keep an internal safety margin in solve(). "
+            "Output contract:\n{contract}\n\n"
+            "Constraint: the external judge timeout is {timeout:.2f}s per case. Keep the algorithm bounded by input size "
+            "and fixed iteration limits; optional time checks should be secondary guards below that limit. "
             "The JSON must include rationale fields name, idea, strategy_combination, parameter_changes, "
             "expected_effect, risk_control, and code containing the complete Python implementation."
         ).format(
@@ -185,6 +301,7 @@ class LLMCodeGenerator:
             disk=_json(disk_results[-8:]),
             impact=_json(previous_impact[-5:]),
             samples="\n\n---\n\n".join(case_samples),
+            contract=SOLVER_OUTPUT_CONTRACT,
             timeout=per_case_timeout,
         )
         text = self._invoke(system, user)
@@ -217,8 +334,15 @@ class LLMCodeGenerator:
     ) -> Candidate:
         system = (
             "You repair AutoSolver candidate solvers. Return exactly one JSON object matching this "
-            "CandidateEnvelope schema. Use solver_examples as reference architectures when fixing construction, "
-            "coverage repair, or local-search issues, while keeping the solver self-contained:\n"
+            "CandidateEnvelope schema. Use the LLM-maintained solver framework when fixing construction, "
+            "coverage repair, or search issues, while keeping the solver self-contained. "
+            f"Allowed import roots are: {ALLOWED_IMPORT_ROOTS_TEXT}. Optional non-standard-library imports must have "
+            "deterministic fallbacks. The standard-library time module is allowed, but do not add unsafe imports "
+            "or change the solve() contract. "
+            "The repaired code must obey this output contract:\n"
+            + SOLVER_OUTPUT_CONTRACT
+            + "\n"
+            "CandidateEnvelope schema:\n"
             + candidate_schema_text()
         )
         user = (
@@ -232,9 +356,12 @@ class LLMCodeGenerator:
             "Memory digest:\n{memory}\n\n"
             "Best code summary:\n{best}\n\n"
             "Score delta/context:\n{score_delta}\n\n"
-            "Solver skill context:\n{solvers}\n\n"
+            "LLM-maintained solver framework:\n{solvers}\n\n"
             "Input case samples:\n{samples}\n\n"
-            "Keep solve() standard-library only and below {timeout:.2f}s per case."
+            "Output contract:\n{contract}\n\n"
+            "Keep solve() within the validator-approved import policy and efficient for an external "
+            "{timeout:.2f}s per-case judge. "
+            "Prefer deterministic input-size bounds; time-based cutoffs may be used as secondary guards."
         ).format(
             attempt=attempt,
             iteration=iteration,
@@ -249,6 +376,7 @@ class LLMCodeGenerator:
             score_delta=_json(score_delta or {}),
             solvers=solver_context,
             samples="\n\n---\n\n".join(case_samples),
+            contract=SOLVER_OUTPUT_CONTRACT,
             timeout=per_case_timeout,
         )
         text = self._invoke(system, user)
@@ -262,33 +390,6 @@ class LLMCodeGenerator:
             rationale=rationale,
             iteration=iteration,
             source="llm_repair",
-        )
-
-    def generate(
-        self,
-        iteration: int,
-        instance_features: Dict[str, Any],
-        strategy_context: str,
-        solver_context: str,
-        memory_digest: Dict[str, Any],
-        disk_results: List[Dict[str, Any]],
-        previous_impact: List[Dict[str, Any]],
-        case_samples: List[str],
-        per_case_timeout: float,
-    ) -> Candidate:
-        """Compatibility wrapper for the previous generator API."""
-
-        plan = self._fallback_plan(iteration, instance_features.get("aggregate", instance_features), memory_digest)
-        return self.generate_from_plan(
-            iteration=iteration,
-            plan=plan,
-            instance_features=instance_features,
-            solver_context=solver_context,
-            memory_digest=memory_digest,
-            disk_results=disk_results,
-            previous_impact=previous_impact,
-            case_samples=case_samples,
-            per_case_timeout=per_case_timeout,
         )
 
     def _invoke(self, system: str, user: str) -> str:
@@ -307,54 +408,12 @@ class LLMCodeGenerator:
             return "\n".join(part for part in parts if part)
         return str(content)
 
-    def _fallback_plan(self, iteration: int, features: Dict[str, Any], memory_digest: Dict[str, Any]) -> SolverPlan:
-        aggregate = features.get("aggregate", features)
-        focus = aggregate.get("recommended_focus", []) or aggregate.get("tags", [])
-        bandit = memory_digest.get("bandit_recommendations", [])
-        if bandit:
-            focus = [item.get("arm") for item in bandit if item.get("arm")] + list(focus)
-        strategies = [str(item) for item in focus if item]
-        return SolverPlan(
-            name=f"autosolver_plan_{iteration:03d}",
-            strategy_combination=list(dict.fromkeys(strategies))[:5] or ["expected_greedy", "local_search_repair"],
-            parameter_changes={},
-            exploration_mode="balanced",
-            reasoning="Fallback plan built from classified features, memory digest, and bandit recommendations.",
-            risk_control="Generate standard-library solve() and rely on validator/scorer repair loop.",
-            generation_directives=[
-                "Prefer valid disjoint assignments before penalty optimization.",
-                "Use internal time checks below the judge timeout.",
-                "Repair uncovered tasks after any bundle-first construction.",
-            ],
-        )
+def sanitize_name(value: Any, default_name: str) -> str:
+    import re
 
-
-def extract_python_code(text: str) -> str:
-    blocks = re.findall(r"```(?:python|py)\s*(.*?)```", text, flags=re.IGNORECASE | re.DOTALL)
-    if blocks:
-        return blocks[-1].strip()
-    if "def solve" in text:
-        return text[text.index("def solve") :].strip()
-    return ""
-
-
-def extract_json_block(text: str) -> Dict[str, Any]:
-    blocks = re.findall(r"```json\s*(.*?)```", text, flags=re.IGNORECASE | re.DOTALL)
-    candidates = blocks or re.findall(r"(\{.*?\})", text, flags=re.DOTALL)
-    for raw in candidates:
-        try:
-            value = json.loads(raw)
-        except Exception:
-            continue
-        if isinstance(value, dict):
-            return value
-    return {}
-
-
-def sanitize_name(value: Any, fallback: str) -> str:
-    raw = str(value or fallback)
+    raw = str(value or default_name)
     name = re.sub(r"[^A-Za-z0-9_.-]+", "_", raw).strip("._-")
-    return (name or fallback)[:80]
+    return (name or default_name)[:80]
 
 
 def _json(value: Any) -> str:
@@ -362,12 +421,9 @@ def _json(value: Any) -> str:
 
 
 def _tool_message(content: str, tool_call_id: Optional[str], name: Optional[str]) -> Any:
-    try:
-        from langchain_core.messages import ToolMessage
+    from langchain_core.messages import ToolMessage
 
-        return ToolMessage(content=content, tool_call_id=tool_call_id or name or "tool")
-    except Exception:
-        return ("tool", content)
+    return ToolMessage(content=content, tool_call_id=tool_call_id or name or "tool")
 
 
 def _env_bool(name: str) -> bool:

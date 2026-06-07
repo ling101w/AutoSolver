@@ -8,31 +8,72 @@ import json
 from autosolver_agent import AutoSolverLangChainAgent, __version__
 
 
+def _positive_float(value: str) -> float:
+    parsed = float(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be greater than 0")
+    return parsed
+
+
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return parsed
+
+
+def _non_negative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be at least 0")
+    return parsed
+
+
+def _non_negative_float(value: str) -> float:
+    parsed = float(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be at least 0")
+    return parsed
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Modular LangChain AutoSolver Agent")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     parser.add_argument("--cases", nargs="+", required=True, help="Case TSV files to optimize against.")
     parser.add_argument("--out", default="generated_submit_solution.py", help="Final solver output path.")
-    parser.add_argument("--budget", type=float, default=90.0, help="Total agent budget in seconds.")
-    parser.add_argument("--per-case-timeout", type=float, default=10.0, help="Final judge-equivalent timeout.")
+    parser.add_argument("--budget", type=_positive_float, default=90.0, help="Total agent budget in seconds.")
+    parser.add_argument("--per-case-timeout", type=_positive_float, default=10.0, help="Final judge-equivalent timeout.")
     parser.add_argument(
         "--search-per-case-timeout",
-        type=float,
+        type=_positive_float,
         default=None,
         help="Per-case timeout during candidate search; defaults to --per-case-timeout.",
     )
-    parser.add_argument("--iterations", type=int, default=3, help="Number of LLM improvement iterations.")
+    parser.add_argument("--iterations", type=_positive_int, default=3, help="Number of LLM improvement iterations.")
     parser.add_argument("--memory-dir", default="runs/autosolver_memory", help="JSON long/short-term memory dir.")
     parser.add_argument("--artifact-dir", default="runs/autosolver_artifacts", help="Per-iteration artifact dir.")
     parser.add_argument("--llm-model", default=None, help="LLM model; defaults to AUTOSOLVER_LLM_MODEL or gpt-4o-mini.")
     parser.add_argument("--llm-base-url", default=None, help="OpenAI-compatible base URL.")
-    parser.add_argument("--max-cases", type=int, default=3)
-    parser.add_argument("--finalize-top-k", type=int, default=3)
-    parser.add_argument("--max-repair-attempts", type=int, default=2)
-    parser.add_argument("--memory-top-k", type=int, default=5)
-    parser.add_argument("--bandit-exploration", type=float, default=1.4)
+    parser.add_argument("--max-cases", type=_positive_int, default=3)
+    parser.add_argument("--finalize-top-k", type=_positive_int, default=3)
+    parser.add_argument("--max-repair-attempts", type=_non_negative_int, default=2)
+    parser.add_argument("--memory-top-k", type=_positive_int, default=5)
+    parser.add_argument("--bandit-exploration", type=_non_negative_float, default=1.4)
+    parser.add_argument(
+        "--baseline-solver",
+        "--base-solver",
+        dest="baseline_solvers",
+        action="append",
+        default=[],
+        help="Existing solver .py file to import as a scored baseline before exploration. May be repeated.",
+    )
+    parser.add_argument(
+        "--strategy-workers",
+        type=_positive_int,
+        default=5,
+        help="Worker count. Use 1 for a single workflow; use 2+ for parallel independent worker processes.",
+    )
     parser.add_argument("--summary-out", default=None, help="Optional JSON summary output path.")
-    parser.add_argument("--strict-cases", action="store_true", help="Fail on malformed case rows instead of reporting diagnostics.")
     parser.add_argument("--event-log", default=None, help="Optional JSONL event log path; defaults to artifact-dir/events.jsonl.")
     parser.add_argument("--quiet", action="store_true")
     return parser
@@ -57,8 +98,9 @@ def main() -> None:
         max_repair_attempts=args.max_repair_attempts,
         memory_top_k=args.memory_top_k,
         bandit_exploration=args.bandit_exploration,
+        baseline_solver_paths=args.baseline_solvers,
+        strategy_workers=args.strategy_workers,
         summary_output_path=args.summary_out,
-        strict_cases=args.strict_cases,
         event_log_path=args.event_log,
     )
     report = agent.run()

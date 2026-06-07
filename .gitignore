@@ -6,3 +6,4 @@ __pycache__/
 runs/
 .coverage
 *.egg-info/
+.vscode/settings.json

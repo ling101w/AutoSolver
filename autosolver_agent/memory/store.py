@@ -39,24 +39,19 @@ class MemoryStore:
     def _load_long_term(self) -> Dict[str, Any]:
         with _FileLock(self.lock_path):
             value = self._read_long_term_unlocked()
-        if isinstance(value, dict):
-            return self._ensure_schema(value)
-        return self._new_long_term()
+        return self._ensure_schema(value) if value is not None else self._new_long_term()
 
     def _read_long_term_unlocked(self) -> Optional[Dict[str, Any]]:
         try:
             with open(self.long_term_path, "r", encoding="utf-8") as handle:
                 value = json.load(handle)
-            if isinstance(value, dict):
-                return value
+            if not isinstance(value, dict):
+                raise RuntimeError(f"memory file must contain a JSON object: {self.long_term_path}")
+            return value
         except FileNotFoundError:
-            pass
-        except Exception:
-            corrupt_path = self.long_term_path + ".corrupt"
-            try:
-                os.replace(self.long_term_path, corrupt_path)
-            except Exception:
-                pass
+            return None
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"memory file is not valid JSON: {self.long_term_path}") from exc
         return None
 
     def _new_long_term(self) -> Dict[str, Any]:
@@ -73,37 +68,29 @@ class MemoryStore:
         return self._ensure_schema(value)
 
     def _ensure_schema(self, value: Dict[str, Any]) -> Dict[str, Any]:
-        previous_version = _schema_version(value)
-        value.setdefault("created_at", _now())
-        value.setdefault("updated_at", _now())
-        value["schema_version"] = MEMORY_SCHEMA_VERSION
+        current_version = _schema_version(value)
+        if current_version != MEMORY_SCHEMA_VERSION:
+            raise RuntimeError(
+                f"unsupported memory schema_version {current_version}; expected {MEMORY_SCHEMA_VERSION}. "
+                "Delete or explicitly migrate the memory directory."
+            )
+        for required in ("created_at", "updated_at"):
+            if not isinstance(value.get(required), str):
+                raise RuntimeError(f"memory file is missing required string field: {required}")
         for key in _CAPPED_LONG_TERM_KEYS:
             if not isinstance(value.get(key), list):
-                value[key] = []
-            else:
-                value[key] = _as_list(value[key])
+                raise RuntimeError(f"memory field must be a list: {key}")
+            value[key] = _as_list(value[key], key)
         if not isinstance(value.get("bandit_arms"), dict):
-            value["bandit_arms"] = {}
-        if not value["bandit_arms"] and value.get("experiments"):
-            value["bandit_arms"] = _build_bandit_arms(value.get("experiments", []))
+            raise RuntimeError("memory field must be an object: bandit_arms")
         metadata = value.get("metadata")
         if not isinstance(metadata, dict):
-            metadata = {}
+            raise RuntimeError("memory field must be an object: metadata")
         retention = metadata.get("retention")
         if not isinstance(retention, dict):
-            retention = {}
+            raise RuntimeError("memory metadata.retention must be an object")
         retention["max_items_per_list"] = self.max_long_term_items
         metadata["retention"] = retention
-        if previous_version != MEMORY_SCHEMA_VERSION:
-            migrations = metadata.setdefault("migrations", [])
-            if isinstance(migrations, list):
-                migrations.append(
-                    {
-                        "from_schema_version": previous_version,
-                        "to_schema_version": MEMORY_SCHEMA_VERSION,
-                        "migrated_at": _now(),
-                    }
-                )
         value["metadata"] = metadata
         self._trim_long_term(value)
         return value
@@ -410,14 +397,8 @@ def _positive_int(value: Optional[int], env_name: str, default: int) -> int:
     if value is None:
         raw = os.environ.get(env_name)
         if raw:
-            try:
-                value = int(raw)
-            except ValueError:
-                value = None
-    try:
-        parsed = int(value if value is not None else default)
-    except (TypeError, ValueError):
-        parsed = default
+            value = int(raw)
+    parsed = int(value if value is not None else default)
     return max(1, parsed)
 
 
@@ -425,13 +406,15 @@ def _schema_version(value: Dict[str, Any]) -> int:
     try:
         return int(value.get("schema_version", 0))
     except (TypeError, ValueError):
-        return 0
+        raise RuntimeError("memory schema_version must be an integer")
 
 
-def _as_list(value: Any) -> List[Dict[str, Any]]:
+def _as_list(value: Any, field_name: str = "value") -> List[Dict[str, Any]]:
     if not isinstance(value, list):
-        return []
-    return [item for item in value if isinstance(item, dict)]
+        raise RuntimeError(f"{field_name} must be a list")
+    if not all(isinstance(item, dict) for item in value):
+        raise RuntimeError(f"{field_name} must contain only objects")
+    return list(value)
 
 
 def _build_bandit_arms(records: Sequence[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
