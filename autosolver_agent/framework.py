@@ -257,7 +257,10 @@ class FrameworkStore:
                     "update_mode": "after_each_evaluated_iteration",
                     "guardrails": [
                         "Generated solver code must still obey solve(input_text: str) -> list.",
-                        "Framework entries may propose strategies and implementation guidance, but cannot relax validator, scorer, runtime, or parser constraints.",
+                        (
+                            "Framework entries may propose strategies and implementation guidance, "
+                            "but cannot relax validator, scorer, runtime, or parser constraints."
+                        ),
                     ],
                 },
             },
@@ -330,12 +333,12 @@ class FrameworkStore:
         features = {item.name: item for item in framework.feature_dimensions if item.name not in set(update.retire_feature_names)}
         strategies = {item.name: item for item in framework.strategies if item.name not in set(update.retire_strategy_names)}
         skills = {item.name: item for item in framework.skills if item.name not in set(update.retire_skill_names)}
-        for item in update.feature_dimensions:
-            features[item.name] = item
-        for item in update.strategies:
-            strategies[item.name] = item
-        for item in update.skills:
-            skills[item.name] = item
+        for feature_item in update.feature_dimensions:
+            features[feature_item.name] = feature_item
+        for strategy_item in update.strategies:
+            strategies[strategy_item.name] = strategy_item
+        for skill_item in update.skills:
+            skills[skill_item.name] = skill_item
         return SolverFramework(
             feature_dimensions=list(features.values()),
             strategies=list(strategies.values()),

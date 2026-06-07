@@ -7,12 +7,9 @@ import os
 import time
 from typing import Any, Dict, List, Optional
 
-from autosolver_agent.artifacts import ArtifactStore, write_json
+from autosolver_agent.artifacts import write_json
 from autosolver_agent.caseio import discover_case_paths, load_cases, parse_case
-from autosolver_agent.llm import LLMCodeGenerator
-from autosolver_agent.memory import MemoryStore
-from autosolver_agent.workflow import AutoSolverWorkflow
-from autosolver_agent.workflow.parallel import ParallelAutoSolverRunner, ParallelRunConfig
+from autosolver_agent.workflow import AutoSolverRunConfig, AutoSolverRunner
 
 
 class AutoSolverLangChainAgent:
@@ -35,6 +32,7 @@ class AutoSolverLangChainAgent:
         max_repair_attempts: int = 2,
         memory_top_k: int = 5,
         bandit_exploration: float = 1.4,
+        baseline_solver_paths: Optional[List[str]] = None,
         strategy_workers: int = 5,
         summary_output_path: Optional[str] = None,
         event_log_path: Optional[str] = None,
@@ -56,6 +54,7 @@ class AutoSolverLangChainAgent:
         self.max_repair_attempts = max_repair_attempts
         self.memory_top_k = memory_top_k
         self.bandit_exploration = bandit_exploration
+        self.baseline_solver_paths = [os.path.abspath(path) for path in list(baseline_solver_paths or [])]
         self.strategy_workers = int(strategy_workers)
         self.summary_output_path = summary_output_path
         self.event_log_path = event_log_path
@@ -70,70 +69,32 @@ class AutoSolverLangChainAgent:
         parsed_cases = [parse_case(case.text, case_name=case.name, path=case.path) for case in cases]
 
         deadline = time.time() + self.budget_seconds
-        if self.llm is None and self.strategy_workers >= 2:
-            LLMCodeGenerator.validate_environment()
-            runner = ParallelAutoSolverRunner(
-                cases=cases,
-                parsed_cases=parsed_cases,
-                config=ParallelRunConfig(
-                    iterations=self.iterations,
-                    deadline=deadline,
-                    per_case_timeout=self.per_case_timeout,
-                    search_per_case_timeout=self.search_per_case_timeout,
-                    output_path=self.output_path,
-                    memory_dir=self.memory_dir,
-                    artifact_dir=self.artifact_dir,
-                    llm_model=self.llm_model,
-                    llm_base_url=self.llm_base_url,
-                    verbose=self.verbose,
-                    finalize_top_k=self.finalize_top_k,
-                    max_repair_attempts=self.max_repair_attempts,
-                    memory_top_k=self.memory_top_k,
-                    bandit_exploration=self.bandit_exploration,
-                    strategy_workers=self.strategy_workers,
-                    summary_output_path=self.summary_output_path,
-                    event_log_path=self.event_log_path,
-                ),
-            )
-            report = runner.run()
-            report_path = self.output_path + ".report.json"
-            write_json(report_path, report)
-            return report
-
-        if self.llm is None:
-            LLMCodeGenerator.validate_environment()
-        return self._run_single_workflow(cases, parsed_cases, deadline)
-
-    def _run_single_workflow(
-        self,
-        cases: List[Any],
-        parsed_cases: List[Any],
-        deadline: float,
-    ) -> Dict[str, Any]:
-        memory = MemoryStore(self.memory_dir)
-        artifacts = ArtifactStore(self.artifact_dir)
-        llm = LLMCodeGenerator(model=self.llm_model, base_url=self.llm_base_url, llm=self.llm)
-        workflow = AutoSolverWorkflow(
+        runner = AutoSolverRunner(
             cases=cases,
             parsed_cases=parsed_cases,
-            iterations=self.iterations,
-            deadline=deadline,
-            per_case_timeout=self.per_case_timeout,
-            search_per_case_timeout=self.search_per_case_timeout,
-            output_path=self.output_path,
-            memory=memory,
-            artifacts=artifacts,
-            llm=llm,
-            verbose=self.verbose,
-            finalize_top_k=self.finalize_top_k,
-            max_repair_attempts=self.max_repair_attempts,
-            memory_top_k=self.memory_top_k,
-            bandit_exploration=self.bandit_exploration,
-            strategy_workers=self.strategy_workers,
-            summary_output_path=self.summary_output_path,
-            event_log_path=self.event_log_path,
+            config=AutoSolverRunConfig(
+                iterations=self.iterations,
+                deadline=deadline,
+                per_case_timeout=self.per_case_timeout,
+                search_per_case_timeout=self.search_per_case_timeout,
+                output_path=self.output_path,
+                memory_dir=self.memory_dir,
+                artifact_dir=self.artifact_dir,
+                llm_model=self.llm_model,
+                llm_base_url=self.llm_base_url,
+                verbose=self.verbose,
+                finalize_top_k=self.finalize_top_k,
+                max_repair_attempts=self.max_repair_attempts,
+                memory_top_k=self.memory_top_k,
+                bandit_exploration=self.bandit_exploration,
+                baseline_solver_paths=self.baseline_solver_paths,
+                strategy_workers=self.strategy_workers,
+                summary_output_path=self.summary_output_path,
+                event_log_path=self.event_log_path,
+                llm=self.llm,
+            ),
         )
-        report = workflow.run()
+        report = runner.run()
         report_path = self.output_path + ".report.json"
         write_json(report_path, report)
         return report

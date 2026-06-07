@@ -297,7 +297,7 @@ def score_answer(parsed: ParsedCase, answer: Any) -> Dict[str, Any]:
                 "valid": False,
                 "covered": len(used_tasks),
                 "penalty": 1_000_000.0 + total,
-                "error": "bad tuple",
+                "error": "bad tuple: each answer item must be (task_id_list, courier_ids)",
             }
         raw_key, couriers = item
         if not isinstance(raw_key, str) or not isinstance(couriers, list) or not couriers:
@@ -305,7 +305,7 @@ def score_answer(parsed: ParsedCase, answer: Any) -> Dict[str, Any]:
                 "valid": False,
                 "covered": len(used_tasks),
                 "penalty": 1_000_000.0 + total,
-                "error": "bad fields",
+                "error": "bad fields: task_id_list must be str and courier_ids must be a non-empty list[str]",
             }
         tasks = tuple(t.strip() for t in raw_key.split(",") if t.strip())
         task_key = ",".join(tasks)

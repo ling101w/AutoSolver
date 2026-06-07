@@ -21,9 +21,13 @@ SAFE_IMPORT_ROOTS = {
     "heapq",
     "itertools",
     "math",
+    "networkx",
+    "numpy",
     "operator",
     "random",
+    "scipy",
     "statistics",
+    "time",
     "typing",
 }
 

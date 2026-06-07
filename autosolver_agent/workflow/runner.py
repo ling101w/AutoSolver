@@ -1,4 +1,4 @@
-"""Multi-process worker orchestration for AutoSolver workflows."""
+"""Worker orchestration for AutoSolver workflows."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import multiprocessing
 import os
 import time
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from autosolver_agent.artifacts import ArtifactStore, write_json
@@ -19,7 +19,7 @@ from autosolver_agent.workflow.graph import AutoSolverWorkflow, _final_rank
 
 
 @dataclass
-class ParallelRunConfig:
+class AutoSolverRunConfig:
     iterations: int
     deadline: float
     per_case_timeout: float
@@ -37,24 +37,64 @@ class ParallelRunConfig:
     strategy_workers: int
     summary_output_path: Optional[str]
     event_log_path: Optional[str]
+    baseline_solver_paths: List[str] = field(default_factory=list)
+    llm: Any = None
 
 
-class ParallelAutoSolverRunner:
+class AutoSolverRunner:
     def __init__(
         self,
         cases: List[Case],
         parsed_cases: List[ParsedCase],
-        config: ParallelRunConfig,
+        config: AutoSolverRunConfig,
     ) -> None:
         self.cases = cases
         self.parsed_cases = parsed_cases
         self.config = config
 
     def run(self) -> Dict[str, Any]:
-        if self.config.strategy_workers < 2:
-            raise RuntimeError("ParallelAutoSolverRunner requires strategy_workers >= 2.")
+        if self.config.strategy_workers < 1:
+            raise RuntimeError("AutoSolverRunner requires strategy_workers >= 1.")
         if self.config.iterations < 1:
-            raise RuntimeError("ParallelAutoSolverRunner requires iterations >= 1.")
+            raise RuntimeError("AutoSolverRunner requires iterations >= 1.")
+        if self.config.llm is None:
+            LLMCodeGenerator.validate_environment()
+        if self._runs_in_current_process():
+            return self._run_current_process_workflow()
+
+        return self._run_worker_processes()
+
+    def _runs_in_current_process(self) -> bool:
+        return self.config.strategy_workers == 1 or self.config.llm is not None
+
+    def _run_current_process_workflow(self) -> Dict[str, Any]:
+        memory = MemoryStore(self.config.memory_dir)
+        artifacts = ArtifactStore(self.config.artifact_dir)
+        llm = LLMCodeGenerator(model=self.config.llm_model, base_url=self.config.llm_base_url, llm=self.config.llm)
+        workflow = AutoSolverWorkflow(
+            cases=self.cases,
+            parsed_cases=self.parsed_cases,
+            iterations=self.config.iterations,
+            deadline=self.config.deadline,
+            per_case_timeout=self.config.per_case_timeout,
+            search_per_case_timeout=self.config.search_per_case_timeout,
+            output_path=self.config.output_path,
+            memory=memory,
+            artifacts=artifacts,
+            llm=llm,
+            verbose=self.config.verbose,
+            finalize_top_k=self.config.finalize_top_k,
+            max_repair_attempts=self.config.max_repair_attempts,
+            memory_top_k=self.config.memory_top_k,
+            bandit_exploration=self.config.bandit_exploration,
+            baseline_solver_paths=self.config.baseline_solver_paths,
+            strategy_workers=self.config.strategy_workers,
+            summary_output_path=self.config.summary_output_path,
+            event_log_path=self.config.event_log_path,
+        )
+        return workflow.run()
+
+    def _run_worker_processes(self) -> Dict[str, Any]:
         worker_count = self.config.strategy_workers
         iteration_counter = multiprocessing.Value("i", 0)
         iteration_lock = multiprocessing.Lock()
@@ -90,7 +130,7 @@ class ParallelAutoSolverRunner:
 
         if errors:
             first = errors[0]
-            raise RuntimeError(f"parallel worker {first.get('worker_id')} failed: {first.get('error')}")
+            raise RuntimeError(f"worker {first.get('worker_id')} failed: {first.get('error')}")
 
         return self._finalize(worker_count, worker_reports, errors)
 
@@ -114,7 +154,7 @@ class ParallelAutoSolverRunner:
                 code=code,
                 rationale=dict(item.get("rationale") or {}),
                 iteration=int(item.get("iteration") or 0),
-                source="parallel_finalize",
+                source="worker_finalize",
             )
             score = scorer.score(
                 candidate=candidate,
@@ -127,7 +167,7 @@ class ParallelAutoSolverRunner:
                 best_pair = (score, code, item)
 
         if best_pair is None:
-            raise RuntimeError("no scored candidate survived parallel worker finalization")
+            raise RuntimeError("no scored candidate survived worker finalization")
 
         output_path = self.config.output_path if os.path.isabs(self.config.output_path) else os.path.abspath(self.config.output_path)
         with open(output_path, "w", encoding="utf-8") as handle:
@@ -138,9 +178,9 @@ class ParallelAutoSolverRunner:
         framework = FrameworkStore(self.config.memory_dir)
 
         report = {
-            "run_mode": "parallel_workers",
+            "run_mode": "worker_processes",
             "output_path": output_path,
-            "parallel_workers": worker_count,
+            "worker_count": worker_count,
             "strategy_workers_requested": self.config.strategy_workers,
             "iterations_requested": self.config.iterations,
             "iterations_completed": sum(int(report.get("iterations_completed", 0)) for report in worker_reports),
@@ -148,6 +188,7 @@ class ParallelAutoSolverRunner:
             "best_worker_candidate": best_pair[2],
             "worker_reports": worker_reports,
             "worker_errors": errors,
+            "baseline_solver_paths": list(self.config.baseline_solver_paths),
             "long_term_memory_digest": memory.digest(),
             "solver_framework": framework.snapshot(),
             "summary": {
@@ -170,7 +211,7 @@ def _worker_entry(
     iteration_lock: Any,
     cases: List[Case],
     parsed_cases: List[ParsedCase],
-    config: ParallelRunConfig,
+    config: AutoSolverRunConfig,
     queue: multiprocessing.Queue,
 ) -> None:
     try:
@@ -214,6 +255,7 @@ def _worker_entry(
             max_repair_attempts=config.max_repair_attempts,
             memory_top_k=config.memory_top_k,
             bandit_exploration=config.bandit_exploration,
+            baseline_solver_paths=config.baseline_solver_paths,
             strategy_workers=1,
             summary_output_path=None,
             event_log_path=event_log_path,

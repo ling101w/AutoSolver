@@ -68,6 +68,7 @@ class AutoSolverWorkflow:
         max_repair_attempts: int = 2,
         memory_top_k: int = 5,
         bandit_exploration: float = 1.4,
+        baseline_solver_paths: Optional[List[str]] = None,
         strategy_workers: int = 1,
         summary_output_path: Optional[str] = None,
         event_log_path: Optional[str] = None,
@@ -87,6 +88,7 @@ class AutoSolverWorkflow:
         self.max_repair_attempts = max(0, max_repair_attempts)
         self.memory_top_k = max(1, memory_top_k)
         self.bandit_exploration = bandit_exploration
+        self.baseline_solver_paths = [os.path.abspath(path) for path in list(baseline_solver_paths or [])]
         self.strategy_workers = max(1, int(strategy_workers or 1))
         self.iteration_stride = 1
         self.summary_output_path = summary_output_path
@@ -111,7 +113,7 @@ class AutoSolverWorkflow:
         )
         self.events = build_event_recorder(self.run_state.event_log_path, run_id)
         self.framework_store = FrameworkStore(self.memory.memory_dir)
-        self.validator = Validator(smoke_timeout=min(2.0, search_per_case_timeout))
+        self.validator = Validator(smoke_timeout=search_per_case_timeout)
         self.scorer = Scorer(per_case_timeout=search_per_case_timeout)
         self.instance_features: Dict[str, Any] = {}
         self.objective_features: Dict[str, Any] = {}
@@ -129,8 +131,10 @@ class AutoSolverWorkflow:
         self.bandit_trace: List[Dict[str, Any]] = []
         self.experiment_records: List[Dict[str, Any]] = []
         self.framework_updates: List[Dict[str, Any]] = []
+        self.baseline_imports: List[Dict[str, Any]] = []
         self.notes: List[str] = []
         self.final_solver_path: Optional[str] = None
+        self._baseline_imported = False
         self.generation_service = GenerationService(self)
         self.evaluation_service = EvaluationService(self)
         self.repair_service = RepairService(self)
@@ -258,6 +262,7 @@ class AutoSolverWorkflow:
             iteration=iteration,
             context={"case_count": len(self.cases), "tags": aggregate.get("tags", []), "recommended_focus": aggregate.get("recommended_focus", [])},
         )
+        self._import_baseline_solvers()
         return {"phase": "generate", "iteration": 1}
 
     def _generate_candidate(self, state: WorkflowState) -> WorkflowState:
@@ -595,6 +600,117 @@ class AutoSolverWorkflow:
     def _strategy_worker_count(self, candidate_count: int) -> int:
         return max(1, min(self.strategy_workers, max(1, candidate_count)))
 
+    def _import_baseline_solvers(self) -> None:
+        if self._baseline_imported or not self.baseline_solver_paths:
+            self._baseline_imported = True
+            return
+        self._baseline_imported = True
+        aggregate_features = self.instance_features.get("aggregate", {})
+        used_names = set(self.run_state.candidate_hashes)
+        for index, path in enumerate(self.baseline_solver_paths, start=1):
+            candidate = self._load_baseline_candidate(path, index, used_names)
+            self.candidates.append(candidate)
+            candidate_hash = self._remember_candidate_hash(candidate)
+            artifact = self.artifacts.save_candidate(candidate)
+            self._remember_candidate_artifact(candidate, artifact)
+            candidate.rationale["_artifact_validation_path"] = artifact.validation_path
+            self.memory.record_candidate(candidate.iteration, candidate.name, candidate.rationale, aggregate_features)
+            validation = self.validator.validate(candidate.code, self.cases, self.parsed_cases)
+            self.artifacts.save_validation(artifact, validation)
+            self.memory.record_validation(candidate.iteration, validation)
+            record: Dict[str, Any] = {
+                "candidate": candidate.name,
+                "source_path": path,
+                "valid": validation.valid,
+                "validation": serialize(validation),
+                "artifact": serialize(artifact),
+            }
+            if not validation.valid:
+                error_item = {"iteration": candidate.iteration, "candidate": candidate.name, "errors": validation.errors}
+                self.validation_errors.append(error_item)
+                self._record_experiment(
+                    candidate.iteration,
+                    candidate,
+                    validation=validation,
+                    artifact=artifact,
+                    failure_reason="baseline validation failed",
+                )
+                self.baseline_imports.append(record)
+                self._record_event(
+                    "baseline_validation_failed",
+                    phase="classify",
+                    iteration=candidate.iteration,
+                    candidate=candidate.name,
+                    candidate_hash=candidate_hash,
+                    context={"source_path": path, "stage": validation.stage, "errors": validation.errors},
+                )
+                self.log(f"baseline {candidate.name}: validation failed at {validation.stage}")
+                continue
+
+            score = self.scorer.score(
+                candidate=candidate,
+                cases=self.cases,
+                parsed_cases=self.parsed_cases,
+                best=self.best_score,
+                timeout=self.search_per_case_timeout,
+            )
+            impact = self._impact(candidate, score)
+            self.scores.append(score)
+            self.artifacts.save_score(artifact, score)
+            self.impact_analysis.append(impact)
+            self.artifacts.save_impact(artifact, impact)
+            self.memory.record_score(candidate.iteration, score, impact)
+            self._record_experiment(candidate.iteration, candidate, score=score, validation=validation, artifact=artifact)
+            record["score"] = serialize(score)
+            record["impact"] = impact
+            self.baseline_imports.append(record)
+            self._record_event(
+                "baseline_scored",
+                phase="classify",
+                iteration=candidate.iteration,
+                candidate=candidate.name,
+                candidate_hash=candidate_hash,
+                context={"source_path": path, "rank": list(score.rank), "covered": score.total_covered, "penalty": score.total_penalty},
+            )
+            if self.best_score is None or score.rank < self.best_score.rank:
+                self.best_score = score
+                self.best_candidate = candidate
+                self.log(
+                    f"baseline {candidate.name}: current best "
+                    f"covered={score.total_covered}/{score.total_tasks} penalty={score.total_penalty:.4f}"
+                )
+            else:
+                self.log(f"baseline {candidate.name}: scored but did not improve current best")
+
+    def _load_baseline_candidate(self, path: str, index: int, used_names: set[str]) -> Candidate:
+        abs_path = os.path.abspath(path)
+        with open(abs_path, "r", encoding="utf-8") as handle:
+            code = handle.read()
+        stem = os.path.splitext(os.path.basename(abs_path))[0]
+        base = sanitize_name(f"baseline_{stem}", f"baseline_solver_{index:02d}")
+        name = base
+        counter = 2
+        while name in used_names:
+            name = sanitize_name(f"{base}_{counter}", f"baseline_solver_{index:02d}")
+            counter += 1
+        used_names.add(name)
+        return Candidate(
+            name=name,
+            code=code,
+            rationale={
+                "name": name,
+                "idea": "Imported existing solver as a scored baseline for exploration.",
+                "strategy_combination": ["imported_baseline", stem],
+                "parameter_changes": {"source_path": abs_path},
+                "expected_effect": "Seed the run with a validated starting point and let later candidates explore improvements.",
+                "risk_control": "Run through the same static, runtime, scoring, and finalization checks as generated solvers.",
+                "source_path": abs_path,
+                "import_index": index,
+            },
+            iteration=0,
+            source="baseline_import",
+        )
+
     def _normalize_candidate_name(
         self,
         candidate: Candidate,
@@ -720,8 +836,9 @@ class AutoSolverWorkflow:
             "candidate_hashes": self.run_state.candidate_hashes,
             "cases": [case.name for case in self.cases],
             "iterations_requested": self.iterations,
-            "iterations_completed": len({candidate.iteration for candidate in self.candidates}),
+            "iterations_completed": self._completed_iteration_count(),
             "strategy_workers": self.strategy_workers,
+            "baseline_solvers": self.baseline_imports,
             "best": serialize(self.best_score) if self.best_score else None,
             "instance_features": self.instance_features,
             "solver_framework": self.framework_store.snapshot(),
@@ -1056,11 +1173,13 @@ class AutoSolverWorkflow:
     def _summary(self) -> Dict[str, Any]:
         return {
             "iterations_requested": self.iterations,
-            "iterations_completed": len({candidate.iteration for candidate in self.candidates}),
-            "candidates_generated": len(self.candidates),
+            "iterations_completed": self._completed_iteration_count(),
+            "candidates_generated": self._generated_candidate_count(),
             "repairs_attempted": len(self.repair_history),
             "valid_scores": len(self.scores),
             "validation_failures": len(self.validation_errors),
+            "baseline_solvers_imported": len(self.baseline_imports),
+            "baseline_valid_scores": len([item for item in self.baseline_imports if item.get("valid")]),
             "best_candidate": self.best_candidate.name if self.best_candidate else None,
             "best_rank": list(self.best_score.rank) if self.best_score else None,
             "best_penalty": round(self.best_score.total_penalty, 6) if self.best_score else None,
@@ -1069,6 +1188,12 @@ class AutoSolverWorkflow:
             "bandit_arms": self.memory.long_term.get("bandit_arms", {}),
             "framework": self.framework_store.digest(),
         }
+
+    def _completed_iteration_count(self) -> int:
+        return len({candidate.iteration for candidate in self.candidates if candidate.iteration > 0})
+
+    def _generated_candidate_count(self) -> int:
+        return len([candidate for candidate in self.candidates if candidate.iteration > 0])
 
 
 def _final_rank(score: ScoreResult) -> tuple:

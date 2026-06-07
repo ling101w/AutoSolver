@@ -23,7 +23,6 @@ FORBIDDEN_IMPORT_ROOTS = {
     "shutil",
     "glob",
     "importlib",
-    "time",
 }
 
 FORBIDDEN_CALLS = {
@@ -85,9 +84,6 @@ class Validator:
             errors.append({"type": "missing_contract", "message": "missing top-level solve function"})
         for node in ast.walk(tree):
             if isinstance(node, (ast.Import, ast.ImportFrom)):
-                names = [alias.name for alias in node.names]
-                if isinstance(node, ast.ImportFrom) and node.module:
-                    names.append(node.module)
                 if isinstance(node, ast.ImportFrom) and node.level:
                     errors.append(
                         {
@@ -96,6 +92,8 @@ class Validator:
                             "line": getattr(node, "lineno", None),
                         }
                     )
+                    continue
+                names = [alias.name for alias in node.names] if isinstance(node, ast.Import) else [node.module or ""]
                 for name in names:
                     root = name.split(".")[0]
                     if root in FORBIDDEN_IMPORT_ROOTS or root not in ALLOWED_IMPORT_ROOTS:

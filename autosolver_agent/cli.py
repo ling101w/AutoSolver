@@ -32,6 +32,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--memory-top-k", type=int, default=5)
     parser.add_argument("--bandit-exploration", type=float, default=1.4)
     parser.add_argument(
+        "--baseline-solver",
+        "--base-solver",
+        dest="baseline_solvers",
+        action="append",
+        default=[],
+        help="Existing solver .py file to import as a scored baseline before exploration. May be repeated.",
+    )
+    parser.add_argument(
         "--strategy-workers",
         type=int,
         default=5,
@@ -62,6 +70,7 @@ def main() -> None:
         max_repair_attempts=args.max_repair_attempts,
         memory_top_k=args.memory_top_k,
         bandit_exploration=args.bandit_exploration,
+        baseline_solver_paths=args.baseline_solvers,
         strategy_workers=args.strategy_workers,
         summary_output_path=args.summary_out,
         event_log_path=args.event_log,

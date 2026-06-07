@@ -28,6 +28,15 @@ from autosolver_agent.llm.schema import (
 from autosolver_agent.models import Candidate
 from autosolver_agent.tools.langchain_tools import PlannerToolbox, build_langchain_tools
 
+SOLVER_OUTPUT_CONTRACT = (
+    "solve(input_text: str) must return one flat solution, not a portfolio of alternatives. "
+    "The return value is list[tuple[str, list[str]]]. Each item is "
+    "(task_id_list, courier_ids), where task_id_list is exactly one input task_id_list group string "
+    "such as 't0' or 't1,t2', and courier_ids is a non-empty list of courier_id strings valid for that group. "
+    "Do not return (task_id_list, courier_id) pairs with a bare string courier. "
+    "Do not return dictionaries, row objects, nested lists of multiple solutions, scores, or metadata."
+)
+
 
 class LLMCodeGenerator:
     """Plan, generate, and repair complete candidate solver code."""
@@ -146,8 +155,8 @@ class LLMCodeGenerator:
         system = (
             "You maintain AutoSolver Agent's feature, strategy, and implementation-skill framework. "
             "There is no hardcoded seed catalog. Create an initial solver framework from the objective case statistics, "
-            "historical memory, and the fixed solver safety contract. Do not propose time-based early-stop or deadline logic "
-            "inside generated solve() implementations. Return only JSON matching this SolverFramework schema:\n"
+            "historical memory, and the fixed solver safety contract. Keep generated solve() implementations bounded and "
+            "compatible with the runtime sandbox. Return only JSON matching this SolverFramework schema:\n"
             + solver_framework_schema_text()
         )
         user = (
@@ -155,12 +164,13 @@ class LLMCodeGenerator:
             "Memory digest:\n{memory}\n\n"
             "Input case samples:\n{samples}\n\n"
             "Create feature_dimensions, strategies, and skills that are useful for generating standard-library "
-            "solve(input_text: str) -> list candidates. Do not propose internal search-stage timeout checks, time imports, "
-            "or changes to validator, scorer, runtime, parser, or the output contract."
+            "solve(input_text: str) implementations that obey this output contract:\n{contract}\n\n"
+            "Do not propose changes to validator, scorer, runtime, parser, or the output contract."
         ).format(
             features=_json(objective_features),
             memory=_json(memory_digest),
             samples="\n\n---\n\n".join(case_samples),
+            contract=SOLVER_OUTPUT_CONTRACT,
         )
         return parse_solver_framework(self._invoke(system, user))
 
@@ -206,7 +216,7 @@ class LLMCodeGenerator:
         system = (
             "You maintain AutoSolver Agent's persistent feature/strategy/skill framework after candidate evaluation. "
             "Return a partial update: add or replace only useful framework entries, or retire entries that the evidence "
-            "shows are misleading. Do not add time-based early-stop or deadline logic as a framework skill. "
+            "shows are misleading. Keep framework skills compatible with the runtime sandbox. "
             "The validator, scorer, runtime sandbox, parser, and solve() contract are immutable. "
             "Return only JSON matching this FrameworkUpdate schema:\n"
             + framework_update_schema_text()
@@ -219,8 +229,9 @@ class LLMCodeGenerator:
             "Candidate evaluations:\n{evaluations}\n\n"
             "Recent experiments:\n{experiments}\n\n"
             "Previous impact:\n{impact}\n\n"
-            "Use both successes and failures as evidence. Keep updates concise and safe. Avoid internal timeout logic; "
-            "runtime limits are handled outside candidate code."
+            "Use both successes and failures as evidence. Keep updates concise and safe. Prefer input-size-bounded logic; "
+            "time-aware guards may be used only within the external runtime limits. Preserve this immutable output contract:\n"
+            "{contract}"
         ).format(
             iteration=iteration,
             framework=solver_framework_context,
@@ -229,6 +240,7 @@ class LLMCodeGenerator:
             evaluations=_json(evaluations),
             experiments=_json(experiments[-8:]),
             impact=_json(previous_impact[-8:]),
+            contract=SOLVER_OUTPUT_CONTRACT,
         )
         return parse_framework_update(self._invoke(system, user))
 
@@ -247,10 +259,13 @@ class LLMCodeGenerator:
     ) -> Candidate:
         system = (
             "You are AutoSolver Agent's code generator. Generate one complete Python solver. "
-            "The solver must use only Python standard library and define solve(input_text: str) -> list. "
-            "Do not use file IO, network IO, subprocess, eval, exec, compile, dynamic imports, or the time module. "
-            "Do not implement search-stage timeout checks or deadline-based early exits inside solve(); external runtime "
-            "limits are handled by the agent. "
+            "The solver must use only Python standard library, define solve(input_text: str) -> list, "
+            "and obey this output contract:\n"
+            + SOLVER_OUTPUT_CONTRACT
+            + "\n"
+            "Do not use file IO, network IO, subprocess, eval, exec, compile, or dynamic imports. "
+            "The standard-library time module is allowed for lightweight runtime guards, but candidate code must still "
+            "remain bounded by the external runtime limits. "
             "Use the LLM-maintained solver framework as guidance, but feel free to create a new strategy variation "
             "when the current SolverPlan calls for it. "
             "Return exactly one JSON object matching this CandidateEnvelope schema:\n"
@@ -265,8 +280,9 @@ class LLMCodeGenerator:
             "Disk historical results:\n{disk}\n\n"
             "Previous impact analysis:\n{impact}\n\n"
             "Input case samples:\n{samples}\n\n"
+            "Output contract:\n{contract}\n\n"
             "Constraint: the external judge timeout is {timeout:.2f}s per case. Keep the algorithm bounded by input size "
-            "and fixed iteration limits, not by time checks. "
+            "and fixed iteration limits; optional time checks should be secondary guards below that limit. "
             "The JSON must include rationale fields name, idea, strategy_combination, parameter_changes, "
             "expected_effect, risk_control, and code containing the complete Python implementation."
         ).format(
@@ -278,6 +294,7 @@ class LLMCodeGenerator:
             disk=_json(disk_results[-8:]),
             impact=_json(previous_impact[-5:]),
             samples="\n\n---\n\n".join(case_samples),
+            contract=SOLVER_OUTPUT_CONTRACT,
             timeout=per_case_timeout,
         )
         text = self._invoke(system, user)
@@ -311,8 +328,12 @@ class LLMCodeGenerator:
         system = (
             "You repair AutoSolver candidate solvers. Return exactly one JSON object matching this "
             "CandidateEnvelope schema. Use the LLM-maintained solver framework when fixing construction, "
-            "coverage repair, or search issues, while keeping the solver self-contained. Do not add time imports, "
-            "deadline checks, or search-stage timeout interruption logic inside solve():\n"
+            "coverage repair, or search issues, while keeping the solver self-contained. The standard-library time "
+            "module is allowed, but do not add unsafe imports or change the solve() contract. "
+            "The repaired code must obey this output contract:\n"
+            + SOLVER_OUTPUT_CONTRACT
+            + "\n"
+            "CandidateEnvelope schema:\n"
             + candidate_schema_text()
         )
         user = (
@@ -328,8 +349,9 @@ class LLMCodeGenerator:
             "Score delta/context:\n{score_delta}\n\n"
             "LLM-maintained solver framework:\n{solvers}\n\n"
             "Input case samples:\n{samples}\n\n"
+            "Output contract:\n{contract}\n\n"
             "Keep solve() standard-library only and efficient for an external {timeout:.2f}s per-case judge. "
-            "Use deterministic input-size bounds instead of time-based cutoffs."
+            "Prefer deterministic input-size bounds; time-based cutoffs may be used as secondary guards."
         ).format(
             attempt=attempt,
             iteration=iteration,
@@ -344,6 +366,7 @@ class LLMCodeGenerator:
             score_delta=_json(score_delta or {}),
             solvers=solver_context,
             samples="\n\n---\n\n".join(case_samples),
+            contract=SOLVER_OUTPUT_CONTRACT,
             timeout=per_case_timeout,
         )
         text = self._invoke(system, user)

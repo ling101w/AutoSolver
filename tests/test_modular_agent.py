@@ -18,7 +18,7 @@ from autosolver_agent.memory.store import MEMORY_SCHEMA_VERSION
 from autosolver_agent.models import Case, ScoreResult
 from autosolver_agent.runtime import run_candidate
 from autosolver_agent.tools import Validator
-from autosolver_agent.workflow.parallel import ParallelAutoSolverRunner, ParallelRunConfig
+from autosolver_agent.workflow.runner import AutoSolverRunConfig, AutoSolverRunner
 from solvers import seed_solvers
 
 CASE_TEXT = """task_id_list\tcourier_id\ttotal_score\twillingness
@@ -245,6 +245,12 @@ class ModularAgentTests(unittest.TestCase):
         self.assertTrue(scored["valid"])
         self.assertEqual(scored["covered"], 2)
 
+    def test_score_answer_requires_courier_id_list(self):
+        parsed = parse_case(CASE_TEXT)
+        scored = score_answer(parsed, [("t0", "c1")])
+        self.assertFalse(scored["valid"])
+        self.assertIn("courier_ids", scored["error"])
+
     def test_framework_store_bootstraps_updates_and_rejects_unsafe_payload(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = FrameworkStore(tmp)
@@ -296,13 +302,32 @@ class ModularAgentTests(unittest.TestCase):
         self.assertFalse(result.valid)
         self.assertEqual(result.errors[0]["type"], "invalid_output")
 
+    def test_validator_accepts_submission_sample_solvers(self):
+        with open("examples/demo_case.txt", "r", encoding="utf-8") as handle:
+            case_text = handle.read()
+        parsed = parse_case(case_text, case_name="demo_case.txt")
+        validator = Validator(smoke_timeout=10.0)
+        for path in [
+            "examples/example_solution.txt",
+            "examples/solver_template_1.py",
+            "examples/solver_template_2.py",
+        ]:
+            with self.subTest(path=path):
+                with open(path, "r", encoding="utf-8") as handle:
+                    code = handle.read()
+                result = validator.validate(code, [Case("demo_case.txt", case_text)], [parsed])
+                self.assertTrue(result.valid, result.errors)
+
     def test_sandbox_allows_safe_solver_and_rejects_escape_paths(self):
         safe = """
 import heapq
 import math
+import time
+from time import time as now
 
 def solve(input_text: str) -> list:
-    heap = [math.sqrt(4)]
+    deadline = min(time.time(), now()) + 1
+    heap = [math.sqrt(4), deadline - deadline + 2]
     heapq.heapify(heap)
     return [("t0,t1", ["c2"])] if heapq.heappop(heap) == 2 else []
 """
@@ -319,8 +344,6 @@ def solve(input_text: str) -> list:
             "def solve(input_text: str):\n    __import__('os')\n    return []\n",
             "def solve(input_text: str):\n    globals()\n    return []\n",
             "def solve(input_text: str):\n    return [(().__class__.__name__, [])]\n",
-            "import time\n\ndef solve(input_text: str):\n    deadline = time.time() + 1\n    return []\n",
-            "from time import time\n\ndef solve(input_text: str):\n    deadline = time() + 1\n    return []\n",
         ]
         for code in forbidden_snippets:
             with self.subTest(code=code):
@@ -515,7 +538,7 @@ def solve(input_text: str) -> list:
         self.assertEqual(report["strategy_workers"], 2)
         self.assertGreaterEqual(report["summary"]["candidates_generated"], 2)
 
-    def test_parallel_runner_merges_worker_reports_and_finalizes_global_best(self):
+    def test_runner_merges_worker_reports_and_finalizes_global_best(self):
         with tempfile.TemporaryDirectory() as tmp:
             case = Case("case.txt", CASE_TEXT)
             parsed = parse_case(CASE_TEXT)
@@ -568,7 +591,7 @@ def solve(input_text: str) -> list:
                     )
                 )
 
-            config = ParallelRunConfig(
+            config = AutoSolverRunConfig(
                 iterations=5,
                 deadline=time.time() + 10,
                 per_case_timeout=2,
@@ -587,11 +610,14 @@ def solve(input_text: str) -> list:
                 summary_output_path=None,
                 event_log_path=None,
             )
-            with patch("autosolver_agent.workflow.parallel._worker_entry", side_effect=fake_worker_entry):
-                report = ParallelAutoSolverRunner([case], [parsed], config).run()
+            with patch("autosolver_agent.workflow.runner.LLMCodeGenerator.validate_environment"), patch(
+                "autosolver_agent.workflow.runner._worker_entry",
+                side_effect=fake_worker_entry,
+            ):
+                report = AutoSolverRunner([case], [parsed], config).run()
 
-            self.assertEqual(report["run_mode"], "parallel_workers")
-            self.assertEqual(report["parallel_workers"], 2)
+            self.assertEqual(report["run_mode"], "worker_processes")
+            self.assertEqual(report["worker_count"], 2)
             self.assertEqual(report["iterations_requested"], 5)
             self.assertEqual(report["iterations_completed"], 5)
             claimed = sorted(
@@ -603,6 +629,42 @@ def solve(input_text: str) -> list:
             self.assertTrue(os.path.exists(config.output_path))
             self.assertEqual(report["best"]["name"], "worker_0_solver")
             self.assertEqual(len(report["worker_reports"]), 2)
+
+    def test_runner_strategy_workers_one_runs_current_process_workflow(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            case = Case("case.txt", CASE_TEXT)
+            parsed = parse_case(CASE_TEXT)
+            output_path = os.path.join(tmp, "generated_submit_solution.py")
+            config = AutoSolverRunConfig(
+                iterations=1,
+                deadline=time.time() + 10,
+                per_case_timeout=2,
+                search_per_case_timeout=1,
+                output_path=output_path,
+                memory_dir=os.path.join(tmp, "memory"),
+                artifact_dir=os.path.join(tmp, "artifacts"),
+                llm_model=None,
+                llm_base_url=None,
+                verbose=False,
+                finalize_top_k=1,
+                max_repair_attempts=0,
+                memory_top_k=1,
+                bandit_exploration=1.4,
+                strategy_workers=1,
+                summary_output_path=None,
+                event_log_path=None,
+                llm=FakeLLM(
+                    plan_outputs=[structured_plan("runner_single_plan")],
+                    candidate_outputs=[structured_candidate("runner_single_solver")],
+                ),
+            )
+
+            report = AutoSolverRunner([case], [parsed], config).run()
+
+            self.assertTrue(os.path.exists(output_path))
+            self.assertEqual(report["strategy_workers"], 1)
+            self.assertEqual(report["iterations_completed"], 1)
+            self.assertIsNotNone(report["best"])
 
     def test_agent_with_fake_llm_creates_artifacts_and_solver(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -653,6 +715,47 @@ def solve(input_text: str) -> list:
                 events = [json.loads(line) for line in handle if line.strip()]
             self.assertTrue(events)
             self.assertTrue(all("run_id" in item and "phase" in item and "event" in item for item in events))
+
+    def test_agent_imports_existing_solver_as_baseline_for_exploration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            case_path = os.path.join(tmp, "case.txt")
+            baseline_path = os.path.join(tmp, "baseline_solver.py")
+            out_path = os.path.join(tmp, "generated_submit_solution.py")
+            with open(case_path, "w", encoding="utf-8") as handle:
+                handle.write(CASE_TEXT)
+            with open(baseline_path, "w", encoding="utf-8") as handle:
+                handle.write(VALID_SOLVER)
+
+            agent = AutoSolverLangChainAgent(
+                case_paths=[case_path],
+                output_path=out_path,
+                budget_seconds=10,
+                per_case_timeout=2,
+                search_per_case_timeout=1,
+                iterations=1,
+                memory_dir=os.path.join(tmp, "memory"),
+                artifact_dir=os.path.join(tmp, "artifacts"),
+                llm=FakeLLM(
+                    plan_outputs=[structured_plan("baseline_plan")],
+                    candidate_outputs=[structured_candidate("invalid_generated", INVALID_DUPLICATE_SOLVER)],
+                ),
+                max_cases=1,
+                verbose=False,
+                finalize_top_k=2,
+                max_repair_attempts=0,
+                baseline_solver_paths=[baseline_path],
+                strategy_workers=1,
+            )
+            report = agent.run()
+
+            self.assertEqual(report["summary"]["baseline_solvers_imported"], 1)
+            self.assertEqual(report["summary"]["baseline_valid_scores"], 1)
+            self.assertEqual(report["iterations_completed"], 1)
+            self.assertEqual(report["baseline_solvers"][0]["source_path"], os.path.abspath(baseline_path))
+            self.assertTrue(report["best"]["name"].startswith("baseline_baseline_solver"))
+            self.assertTrue(any(item.get("candidate") == report["best"]["name"] for item in report["experiments"]))
+            with open(out_path, "r", encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), VALID_SOLVER)
 
     def test_agent_strategy_workers_one_runs_single_workflow(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -853,6 +956,10 @@ def solve(input_text: str) -> list:
                 "2.0",
                 "--strategy-workers",
                 "3",
+                "--baseline-solver",
+                "solvers/solver.py",
+                "--base-solver",
+                "solvers/seed_solvers.py",
                 "--summary-out",
                 "runs/summary.json",
                 "--event-log",
@@ -863,6 +970,7 @@ def solve(input_text: str) -> list:
         self.assertEqual(args.memory_top_k, 7)
         self.assertEqual(args.bandit_exploration, 2.0)
         self.assertEqual(args.strategy_workers, 3)
+        self.assertEqual(args.baseline_solvers, ["solvers/solver.py", "solvers/seed_solvers.py"])
         self.assertEqual(args.summary_out, "runs/summary.json")
         self.assertEqual(args.event_log, "runs/events.jsonl")
 

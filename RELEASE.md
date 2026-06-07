@@ -1,35 +1,63 @@
 # Release Notes
 
+## v1.5.0
+
+发布日期：2026-06-07
+
+### 发布定位
+
+`v1.5.0` 是 AutoSolver Agent 的一次文档和发布元数据对齐版本。说明文档已按当前代码从头重写，并把项目描述从旧的 v1.0.0 入口文档更新为当前的 LLM 框架记忆、多策略并行、基线导入、候选修复和事件审计工作流。
+
+### 主要更新
+
+- 将主说明文档统一到 `README.md`，删除对旧 `README_langchain_agent.md` 的依赖。
+- 发布版本更新为 `v1.5.0`，同步 Python 包元数据、CLI `--version` 和 Docker 默认构建版本。
+- 文档覆盖当前运行链路：`classify -> generate -> validate_and_score -> finalize`。
+- 补充 LLM 维护的 `FrameworkStore` 说明，包括 feature dimensions、strategies、skills、bootstrap 和反思更新。
+- 补充 `MemoryStore` 说明，包括长期实验记忆、相似实验检索和 UCB bandit 推荐。
+- 补充多 worker 运行方式：`strategy_workers == 1` 为单工作流，`2+` 为多进程独立 worker 并全局最终复评。
+- 补充 baseline solver 导入方式和最终候选池行为。
+- 补充候选验证、schema 修复、validation 修复、最终 top-k 复核和事件日志说明。
+- 补充 solver 输入输出契约、penalty 公式、安全沙箱限制、产物目录和 Docker 运行示例。
+
+### 发布产物
+
+- Python 包：`autosolver-agent==1.5.0`
+- CLI：`autosolver-agent --version` 输出 `autosolver-agent 1.5.0`
+- Docker 镜像建议标签：`autosolver-agent:1.5.0`
+
+### 验证清单
+
+```bash
+python -m pip install -e ".[dev]"
+ruff check .
+mypy autosolver_agent
+python -m unittest discover -s tests -v
+autosolver-agent --version
+docker build --build-arg VERSION=1.5.0 -t autosolver-agent:1.5.0 .
+docker run --rm autosolver-agent:1.5.0 --version
+docker run --rm autosolver-agent:1.5.0 --help
+```
+
+### 运行约束
+
+- 真实 LLM 运行需要 `OPENAI_API_KEY` 或 `OPENAI_KEY`。
+- 候选 solver 必须定义 `solve(input_text: str) -> list`。
+- 候选 solver 只能使用受允许的 import 和内置函数。
+- `runs/` 是运行态产物目录，不属于发布源码。
+- 已有 memory 目录必须满足当前 schema：`MemoryStore` schema 为 `2`，`FrameworkStore` schema 为 `1`。
+
 ## v1.0.0
 
 发布日期：2026-06-04
 
 ### 发布范围
 
-- 梳理并固化当前模块化 AutoSolver Agent 架构。
+- 梳理并固化模块化 AutoSolver Agent 架构。
 - 将 Python 包版本提升到 `1.0.0`。
-- 新增可安装命令 `autosolver-agent`，作为唯一 CLI 入口。
+- 新增可安装命令 `autosolver-agent`，作为 CLI 入口。
 - 补充 Docker 镜像元数据，默认入口切换为 `autosolver-agent`。
 - 更新说明文档，覆盖架构、输入输出契约、运行方式、Docker 打包和发布检查项。
-
-### 发布产物
-
-- Python 包：`autosolver-agent==1.0.0`
-- Docker 镜像标签：`autosolver-agent:1.0.0`
-- Docker latest 标签：`autosolver-agent:latest`
-
-### 验证清单
-
-```bash
-python -m unittest discover -s tests -v
-python -m ruff check .
-python -m mypy autosolver_agent
-python -m pip install -e .
-autosolver-agent --version
-docker build --build-arg VERSION=1.0.0 -t autosolver-agent:1.0.0 -t autosolver-agent:latest .
-docker run --rm autosolver-agent:1.0.0 --version
-docker run --rm autosolver-agent:1.0.0 --help
-```
 
 ### 运行约束
 
