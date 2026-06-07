@@ -36,7 +36,7 @@ fi
 
 export OPENAI_BASE_URL="${OPENAI_BASE_URL:-${OPENAI_API_BASE:-https://api.openai.com/v1}}"
 export OPENAI_API_BASE="${OPENAI_API_BASE:-$OPENAI_BASE_URL}"
-export AUTOSOLVER_LLM_MODEL="${AUTOSOLVER_LLM_MODEL:-${OPENAI_MODEL:-gpt-4o-mini}}"
+export AUTOSOLVER_LLM_MODEL="${AUTOSOLVER_LLM_MODEL:-${OPENAI_MODEL:-gpt-5.5}}"
 export OPENAI_MODEL="$AUTOSOLVER_LLM_MODEL"
 
 cases=("$@")
@@ -47,14 +47,13 @@ fi
 mkdir -p runs/manual
 
 baseline_args=()
-if [[ -n "${AUTOSOLVER_BASELINE_SOLVER:-}" ]]; then
-  IFS=: read -r -a baseline_solvers <<< "$AUTOSOLVER_BASELINE_SOLVER"
-  for solver_path in "${baseline_solvers[@]}"; do
-    if [[ -n "$solver_path" ]]; then
-      baseline_args+=(--baseline-solver "$solver_path")
-    fi
-  done
-fi
+AUTOSOLVER_BASELINE_SOLVER="${AUTOSOLVER_BASELINE_SOLVER:-examples/solver_template_1.py}"
+IFS=: read -r -a baseline_solvers <<< "$AUTOSOLVER_BASELINE_SOLVER"
+for solver_path in "${baseline_solvers[@]}"; do
+  if [[ -n "$solver_path" ]]; then
+    baseline_args+=(--baseline-solver "$solver_path")
+  fi
+done
 
 "$PYTHON_BIN" -m autosolver_agent.cli \
   --cases "${cases[@]}" \

@@ -1,5 +1,38 @@
 # Release Notes
 
+## v1.5.5
+
+发布日期：2026-06-07
+
+### 发布定位
+
+`v1.5.5` 是 OpenAI 兼容端点和结构化输出容错增强版本。它提升 LLM 返回 JSON 时的恢复能力，并让候选 solver 可以使用更多安全的数据解析 import。
+
+### 主要更新
+
+- Python 包、CLI、Docker 默认版本、CI Docker smoke test 和 GHCR 发布工作流版本更新为 `1.5.5`。
+- 新增 `autosolver_agent.json_utils.load_json_document`，结构化输出和框架解析可从 fenced code block、混杂说明文本和 `<think>...</think>` 包裹内容中恢复首个完整 JSON 文档。
+- 初始 solver framework 解析会先清洗 LLM payload，并移除 skill 中指向未知或 retired strategy 的引用，减少 bootstrap 阶段因为框架引用不一致而失败。
+- `LLMCodeGenerator` 支持 `AUTOSOLVER_LLM_EXTRA_BODY` / `OPENAI_EXTRA_BODY`，可把 JSON 对象透传给 ChatOpenAI 的 `extra_body`，用于 OpenAI 兼容服务的 provider-specific 参数。
+- `run.sh` 默认模型随当前发布配置更新为 `gpt-5.5`，默认 baseline solver 更新为 `examples/solver_template_1.py`；两者仍可通过环境变量覆盖。
+- 候选 solver 安全 import 白名单新增 `csv`、`io`、`json` 和 `re`，便于生成更稳健的 TSV 解析和轻量序列化逻辑。
+- README 同步补充当前版本、Docker 示例、环境变量和 v1.5.5 发布说明。
+
+### 发布产物
+
+- Python 包：`autosolver-agent==1.5.5`
+- CLI：`autosolver-agent --version` 输出 `autosolver-agent 1.5.5`
+- Docker 镜像建议标签：`autosolver-agent:1.5.5`
+
+### 验证清单
+
+```bash
+.venv/bin/ruff check .
+.venv/bin/mypy autosolver_agent
+.venv/bin/python -m unittest discover -s tests -v
+.venv/bin/autosolver-agent --version
+```
+
 ## v1.5.4
 
 发布日期：2026-06-07

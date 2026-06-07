@@ -55,6 +55,7 @@ class LLMCodeGenerator:
         self.temperature = temperature
         self.wire_api = os.environ.get("AUTOSOLVER_WIRE_API") or os.environ.get("OPENAI_WIRE_API")
         self.reasoning_effort = os.environ.get("AUTOSOLVER_REASONING_EFFORT") or os.environ.get("OPENAI_REASONING_EFFORT")
+        self.extra_body = _env_json("AUTOSOLVER_LLM_EXTRA_BODY", "OPENAI_EXTRA_BODY")
         self.request_timeout = _env_float("AUTOSOLVER_LLM_TIMEOUT", "OPENAI_TIMEOUT", "OPENAI_REQUEST_TIMEOUT", default=300.0)
         self.disable_response_storage = _env_bool("AUTOSOLVER_DISABLE_RESPONSE_STORAGE") or _env_bool(
             "OPENAI_DISABLE_RESPONSE_STORAGE"
@@ -85,6 +86,8 @@ class LLMCodeGenerator:
             kwargs["use_responses_api"] = True
         if self.reasoning_effort:
             kwargs["reasoning_effort"] = self.reasoning_effort
+        if self.extra_body is not None:
+            kwargs["extra_body"] = self.extra_body
         if self.disable_response_storage:
             kwargs["store"] = False
         return ChatOpenAI(**kwargs)
@@ -447,3 +450,18 @@ def _env_float(*names: str, default: Optional[float] = None) -> Optional[float]:
             raise RuntimeError(f"{name} must be greater than 0.")
         return parsed
     return default
+
+
+def _env_json(*names: str) -> Optional[Dict[str, Any]]:
+    for name in names:
+        value = os.environ.get(name)
+        if value is None or not str(value).strip():
+            continue
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"{name} must be valid JSON.") from exc
+        if not isinstance(parsed, dict):
+            raise RuntimeError(f"{name} must be a JSON object.")
+        return parsed
+    return None

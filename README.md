@@ -1,6 +1,6 @@
 # AutoSolver Agent
 
-当前发布版本：`v1.5.4`
+当前发布版本：`v1.5.5`
 
 AutoSolver Agent 是一个面向配送分配问题的自动求解器生成系统。它基于 LangChain、LangGraph 和 OpenAI 兼容 LLM 接口，将实例分析、策略规划、候选代码生成、安全验证、评分、长期记忆和最终复核组织成一条可追踪的迭代工作流。
 
@@ -15,6 +15,8 @@ AutoSolver Agent 是一个面向配送分配问题的自动求解器生成系统
 - 实时进度输出：verbose 模式下终端会显示每个 worker、每一轮和每个阶段的进入、完成、耗时、剩余预算和当前摘要。
 - 基线 solver 导入：可通过 `--baseline-solver` 或 `--base-solver` 将已有 `.py` solver 纳入同一验证、评分和最终候选池。
 - 验证与修复闭环：结构化输出失败或候选验证失败后，可由 LLM 在受控次数内修复。
+- LLM JSON 兼容解析：结构化输出和框架解析可从 fenced code block、混杂说明文本和 `<think>...</think>` 包裹内容中恢复 JSON 文档。
+- OpenAI 兼容请求扩展：可通过 `AUTOSOLVER_LLM_EXTRA_BODY` / `OPENAI_EXTRA_BODY` 传入 provider-specific JSON 参数。
 - 子进程沙箱：候选代码在独立进程中执行，受 import 白名单、危险调用检查、CPU 时间和内存限制保护。
 - 可审计产物：每个候选的代码、rationale、validation、score、impact、事件日志、最终报告都会落盘。
 
@@ -205,7 +207,7 @@ list[tuple[str, list[str]]]
 
 - 必须是自包含 Python 代码。
 - 不允许文件 IO、网络 IO、subprocess、动态 import、`eval`、`exec`、`compile`。
-- 允许的 import 根包括 `bisect`、`collections`、`copy`、`dataclasses`、`functools`、`heapq`、`itertools`、`math`、`operator`、`random`、`statistics`、`time`、`typing`，以及运行环境可用的 `numpy`、`scipy`、`networkx`。
+- 允许的 import 根包括 `bisect`、`collections`、`copy`、`csv`、`dataclasses`、`functools`、`heapq`、`io`、`itertools`、`json`、`math`、`operator`、`random`、`re`、`statistics`、`time`、`typing`，以及运行环境可用的 `numpy`、`scipy`、`networkx`。
 
 ## 评分模型
 
@@ -343,15 +345,15 @@ runs/autosolver_artifacts/worker_01/
 
 ```bash
 docker build \
-  --build-arg VERSION=1.5.4 \
+  --build-arg VERSION=1.5.5 \
   --build-arg VCS_REF="$(git rev-parse --short HEAD)" \
-  -t autosolver-agent:1.5.4 .
+  -t autosolver-agent:1.5.5 .
 ```
 
 查看版本：
 
 ```bash
-docker run --rm autosolver-agent:1.5.4 --version
+docker run --rm autosolver-agent:1.5.5 --version
 ```
 
 运行 case：
@@ -363,7 +365,7 @@ docker run --rm \
   -e AUTOSOLVER_LLM_MODEL="$AUTOSOLVER_LLM_MODEL" \
   -v "$PWD/examples:/app/examples:ro" \
   -v "$PWD/runs:/app/runs" \
-  autosolver-agent:1.5.4 \
+  autosolver-agent:1.5.5 \
   --cases examples/demo_case.txt \
   --out runs/docker/generated_submit_solution.py \
   --budget 90 \
@@ -416,6 +418,7 @@ CI 当前执行：
 | `AUTOSOLVER_LLM_TIMEOUT` / `OPENAI_TIMEOUT` / `OPENAI_REQUEST_TIMEOUT` | 单次 LLM 请求超时秒数，默认 `300`。 |
 | `AUTOSOLVER_WIRE_API` / `OPENAI_WIRE_API` | 设为 `responses` 时启用 responses API。 |
 | `AUTOSOLVER_REASONING_EFFORT` / `OPENAI_REASONING_EFFORT` | 传递 reasoning effort。 |
+| `AUTOSOLVER_LLM_EXTRA_BODY` / `OPENAI_EXTRA_BODY` | JSON 对象字符串，透传给 ChatOpenAI 的 `extra_body`，用于 OpenAI 兼容服务的额外参数。 |
 | `AUTOSOLVER_DISABLE_RESPONSE_STORAGE` / `OPENAI_DISABLE_RESPONSE_STORAGE` | 为真时向 ChatOpenAI 传入 `store=False`。 |
 | `AUTOSOLVER_MEMORY_MAX_ITEMS` | 长期记忆每类列表保留上限。 |
 
@@ -424,6 +427,7 @@ CI 当前执行：
 | 环境变量 | 默认值 |
 | --- | --- |
 | `PYTHON_BIN` | 自动检测。 |
+| `AUTOSOLVER_LLM_MODEL` / `OPENAI_MODEL` | `gpt-5.5` |
 | `AUTOSOLVER_OUT` | `runs/manual/generated_submit_solution.py` |
 | `AUTOSOLVER_BUDGET` | `3600` |
 | `AUTOSOLVER_ITERATIONS` | `100` |
@@ -433,8 +437,8 @@ CI 当前执行：
 | `AUTOSOLVER_MEMORY_DIR` | `runs/autosolver_memory` |
 | `AUTOSOLVER_ARTIFACT_DIR` | `runs/autosolver_artifacts` |
 | `AUTOSOLVER_SUMMARY_OUT` | `runs/manual/summary.json` |
-| `AUTOSOLVER_BASELINE_SOLVER` | 空，多个 solver 用 `:` 分隔。 |
+| `AUTOSOLVER_BASELINE_SOLVER` | `examples/solver_template_1.py`，多个 solver 用 `:` 分隔。 |
 
 ## 发布说明
 
-`v1.5.4` 增强长时间运行的可观测性：verbose 模式下会把每个 worker、每轮迭代和关键阶段的实时进度摘要输出到终端，`--quiet` 仍保持静默。详细发布记录见 `RELEASE.md`。
+`v1.5.5` 增强 OpenAI 兼容端点和结构化输出容错：支持 provider-specific `extra_body`，可从混杂文本中恢复 JSON，并放宽候选 solver 的安全解析 import 白名单。详细发布记录见 `RELEASE.md`。

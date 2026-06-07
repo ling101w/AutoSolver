@@ -7,6 +7,8 @@ from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from autosolver_agent.json_utils import load_json_document
+
 
 class SolverPlan(BaseModel):
     """High-level plan produced before code generation."""
@@ -118,10 +120,8 @@ def model_dump(value: BaseModel) -> Dict[str, Any]:
 
 
 def _load_json_like(text_or_value: Any) -> Any:
-    if isinstance(text_or_value, (dict, list)):
-        return text_or_value
     text = str(text_or_value).strip()
     try:
-        return json.loads(text)
+        return load_json_document(text_or_value)
     except Exception as exc:
         raise StructuredOutputError(f"response is not valid JSON: {exc}", text[:4000]) from exc

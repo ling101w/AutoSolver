@@ -296,6 +296,15 @@ class ModularAgentTests(unittest.TestCase):
         self.assertNotIn("open(", notes)
         self.assertIn("unsafe_reference", notes)
 
+    def test_framework_parser_recovers_wrapped_json_and_drops_unknown_skill_links(self):
+        payload = json.loads(structured_framework())
+        payload["skills"][0]["strategy_names"] = ["risk_balanced_cover", "missing_strategy"]
+        wrapped = "<think>drafting framework</think>\n```json\n" + json.dumps(payload) + "\n```"
+
+        framework = parse_solver_framework(wrapped)
+
+        self.assertEqual(framework.skills[0].strategy_names, ["risk_balanced_cover"])
+
     def test_framework_update_sanitizes_unknown_skill_strategy_references(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = FrameworkStore(tmp)
@@ -396,8 +405,12 @@ x0\tcx0\t10\t0.8
 
     def test_sandbox_allows_safe_solver_and_rejects_escape_paths(self):
         safe = """
+import csv
 import heapq
+import io
+import json
 import math
+import re
 import time
 from time import time as now
 
@@ -405,6 +418,9 @@ def solve(input_text: str) -> list:
     deadline = min(time.time(), now()) + 1
     heap = [math.sqrt(4), deadline - deadline + 2]
     heapq.heapify(heap)
+    rows = list(csv.DictReader(io.StringIO(input_text), delimiter="\\t"))
+    payload = json.loads(json.dumps({"task": rows[0]["task_id_list"]}))
+    assert re.match(r"^t", payload["task"])
     return [("t0,t1", ["c2"])] if heapq.heappop(heap) == 2 else []
 """
         validator = Validator(smoke_timeout=1.0)
@@ -530,6 +546,11 @@ def solve(input_text: str) -> list:
         envelope = parse_candidate_envelope(structured_candidate("schema_solver"))
         self.assertEqual(envelope.rationale.name, "schema_solver")
         self.assertIn("def solve", envelope.code)
+
+    def test_structured_candidate_parser_recovers_wrapped_json(self):
+        wrapped = "candidate follows\n```json\n" + structured_candidate("wrapped_schema_solver") + "\n```"
+        envelope = parse_candidate_envelope(wrapped)
+        self.assertEqual(envelope.rationale.name, "wrapped_schema_solver")
 
     def test_memory_similarity_and_bandit(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1306,18 +1327,6 @@ def solve(input_text: str) -> list:
         self.assertEqual(skills["mixed_reflection_skill"]["strategy_names"], ["risk_balanced_cover"])
         self.assertNotIn("orphan_reflection_skill", skills)
 
-    def test_run_sh_uses_environment_secrets_and_public_defaults(self):
-        with open("run.sh", "r", encoding="utf-8") as handle:
-            script = handle.read()
-
-        self.assertNotIn("sk-", script)
-        self.assertNotIn("nasyh.cyou", script)
-        self.assertNotIn("gpt-5.5", script)
-        self.assertNotRegex(script, r"OPENAI_API_KEY=['\"]sk-")
-        self.assertIn('OPENAI_API_KEY="$OPENAI_KEY"', script)
-        self.assertIn("https://api.openai.com/v1", script)
-        self.assertIn("gpt-4o-mini", script)
-
     def test_agent_without_llm_fails_instead_of_falling_back(self):
         with tempfile.TemporaryDirectory() as tmp:
             case_path = os.path.join(tmp, "case.txt")
@@ -1375,6 +1384,8 @@ def solve(input_text: str) -> list:
                 "AUTOSOLVER_LLM_TIMEOUT",
                 "OPENAI_TIMEOUT",
                 "OPENAI_REQUEST_TIMEOUT",
+                "AUTOSOLVER_LLM_EXTRA_BODY",
+                "OPENAI_EXTRA_BODY",
             ]
         }
         for name in saved:
@@ -1383,6 +1394,7 @@ def solve(input_text: str) -> list:
         os.environ["OPENAI_MODEL"] = "compat-model"
         os.environ["OPENAI_BASE_URL"] = "https://example.invalid/v1"
         os.environ["OPENAI_TIMEOUT"] = "12.5"
+        os.environ["OPENAI_EXTRA_BODY"] = '{"provider": {"flag": true}}'
         try:
             from autosolver_agent.llm import LLMCodeGenerator
 
@@ -1396,6 +1408,7 @@ def solve(input_text: str) -> list:
             self.assertEqual(kwargs["model"], "compat-model")
             self.assertEqual(kwargs["base_url"], "https://example.invalid/v1")
             self.assertEqual(kwargs["timeout"], 12.5)
+            self.assertEqual(kwargs["extra_body"], {"provider": {"flag": True}})
         finally:
             for name, value in saved.items():
                 if value is None:

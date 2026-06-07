@@ -10,6 +10,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from autosolver_agent.json_utils import load_json_document
+
 FRAMEWORK_SCHEMA_VERSION = 1
 _MAX_HISTORY_ITEMS = 200
 _DANGEROUS_FRAGMENTS = (
@@ -385,7 +387,8 @@ def parse_solver_framework(text_or_value: Any) -> SolverFramework:
     value = _load_json_like(text_or_value)
     if not isinstance(value, dict):
         raise FrameworkValidationError("framework response is not a JSON object")
-    framework = SolverFramework.model_validate(_sanitize_llm_payload(value.get("solver_framework", value)))
+    payload = _sanitize_framework_payload(value.get("solver_framework", value))
+    framework = SolverFramework.model_validate(payload)
     _validate_safe_payload(framework.model_dump(mode="json"))
     return framework
 
@@ -421,11 +424,8 @@ def framework_update_schema_text() -> str:
 
 
 def _load_json_like(text_or_value: Any) -> Any:
-    if isinstance(text_or_value, (dict, list)):
-        return text_or_value
-    text = str(text_or_value).strip()
     try:
-        return json.loads(text)
+        return load_json_document(text_or_value)
     except Exception as exc:
         raise FrameworkValidationError(f"response is not valid JSON: {exc}") from exc
 
@@ -475,6 +475,45 @@ def _sanitize_llm_payload(value: Any) -> Any:
     if isinstance(value, dict):
         return {key: _sanitize_llm_payload(item) for key, item in value.items()}
     return value
+
+
+def _sanitize_framework_payload(value: Any) -> Any:
+    payload = _sanitize_llm_payload(value)
+    if not isinstance(payload, dict):
+        return payload
+    strategies = payload.get("strategies")
+    skills = payload.get("skills")
+    if not isinstance(strategies, list) or not isinstance(skills, list):
+        return payload
+
+    active_strategy_names = {
+        _clean_name(str(item.get("name", "")), "strategy")
+        for item in strategies
+        if isinstance(item, dict) and str(item.get("status", "active")).lower() != "retired"
+    }
+    if not active_strategy_names:
+        return payload
+
+    sanitized_skills = []
+    changed = False
+    for skill in skills:
+        if not isinstance(skill, dict):
+            sanitized_skills.append(skill)
+            continue
+        strategy_names = skill.get("strategy_names")
+        if not isinstance(strategy_names, list):
+            sanitized_skills.append(skill)
+            continue
+        kept = [
+            _clean_name(str(name), "strategy")
+            for name in strategy_names
+            if _clean_name(str(name), "strategy") in active_strategy_names
+        ]
+        if kept != strategy_names:
+            changed = True
+            skill = {**skill, "strategy_names": kept}
+        sanitized_skills.append(skill)
+    return {**payload, "skills": sanitized_skills} if changed else payload
 
 
 def _framework_counts(framework: SolverFramework) -> Dict[str, int]:
