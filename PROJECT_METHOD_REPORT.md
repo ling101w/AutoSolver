@@ -103,7 +103,7 @@ CLI / Python API
 
 ### 为什么这样设计
 
-初学者可以理解为：`__init__.py` 是包的“门面”。它把最常用的东西放在门口，外部调用不必知道内部目录结构。
+可以理解为：`__init__.py` ，外部调用不必知道内部目录结构。
 
 ---
 
@@ -2712,7 +2712,7 @@ total_penalty + BIG * 未覆盖任务数
 3. 依次选择未冲突的骑手和任务组。
 4. 返回 `[(task_id_list, [courier_id]), ...]`。
 
-适合初学者理解 solver 输出契约。
+适合理解 solver 输出契约。
 
 ---
 
@@ -3022,10 +3022,6 @@ Python 项目标准配置文件。
 7. 设置 baseline solver。
 8. 调用 `python -m autosolver_agent.cli`。
 
-### 初学者理解
-
-它相当于把一长串命令参数做成快捷按钮。
-
 ## 8.5 `.github/workflows/ci.yml`
 
 ### 作用
@@ -3063,7 +3059,7 @@ Python 项目标准配置文件。
 
 ---
 
-# 9. 面试讲解建议
+# 9. 阅读建议
 
 ## 9.1 一句话介绍
 
@@ -3079,7 +3075,7 @@ Python 项目标准配置文件。
 6. **并行搜索**：strategy workers 支持多候选、多进程独立探索和全局复核。
 7. **工程交付**：CLI、Docker、CI、Ruff、Mypy、unittest 全套具备。
 
-## 9.3 初学者版架构比喻
+## 9.3 架构比喻
 
 - `caseio.py`：读题和判题规则。
 - `LLMCodeGenerator`：请大模型想办法和写代码。
